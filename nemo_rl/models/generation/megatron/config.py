@@ -26,7 +26,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     while Megatron training might want `transformer_impl: "transformer_engine"`.
     """
 
-    async_engine: bool
     expose_http_server: bool
     parsers: list[str]
 

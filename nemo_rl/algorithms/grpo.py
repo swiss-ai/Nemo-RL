@@ -1996,7 +1996,11 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
-        return mcore_cfg.get("async_engine", False)
+        assert mcore_cfg.get("async_engine", False), (
+            "Megatron Inference backend requires async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        return True
 
     return False
 
