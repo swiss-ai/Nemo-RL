@@ -528,6 +528,15 @@ class MegatronGenerationMixin:
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(
             inference_model
         )
+        kda_inference_state_config = None
+        if getattr(model_config, "experimental_attention_variant", None) == "kda":
+            from megatron.core.inference.config import KDAInferenceStateConfig
+
+            kda_inference_state_config = KDAInferenceStateConfig.from_model(
+                inference_model
+            )
+            if kda_inference_state_config is None:
+                raise ValueError("KDA model has no KDA inference state")
         is_hybrid_model = mamba_inference_state_config is not None
         if is_hybrid_model:
             if (
@@ -590,6 +599,10 @@ class MegatronGenerationMixin:
             "image_preprocessing_config": image_preprocessing_config,
             "video_preprocessing_config": video_preprocessing_config,
         }
+        if kda_inference_state_config is not None:
+            inference_config_kwargs["kda_inference_state_config"] = (
+                kda_inference_state_config
+            )
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
         )
