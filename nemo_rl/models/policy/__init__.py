@@ -45,22 +45,7 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
-    # load-bearing across the currently supported backend environments.
-    # TODO: remove this patch (and the assert below) once the deepseek_v3
-    # entries actually disappear upstream.
-    # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
-        f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
-        "Check if the upstream fix now applies and remove this patch if so."
-    )
-
     from transformers import AutoTokenizer
-    from transformers.models.auto.tokenization_auto import (
-        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
-        TOKENIZER_MAPPING_NAMES,
-    )
 
     _original_from_pretrained = AutoTokenizer.from_pretrained
 
@@ -72,11 +57,55 @@ def _patch_transformers_tokenizer_class_set():
             return _original_from_pretrained(
                 pretrained_model_name_or_path, *args, **kwargs
             )
-        except Exception:
+        except Exception as tokenizer_error:
             # Moonlight goes here: it ships no tokenizer.json (only
             # tiktoken.model + remote-code TikTokenTokenizer), so the blocklist
             # prevents loading. Strip deepseek_v3 from the registries so
             # trust_remote_code / auto_map takes over.
+            config = kwargs.get("config")
+            if config is None:
+                try:
+                    from transformers import AutoConfig
+
+                    config_kwargs = {
+                        key: kwargs[key]
+                        for key in (
+                            "cache_dir",
+                            "force_download",
+                            "local_files_only",
+                            "revision",
+                            "subfolder",
+                            "token",
+                            "trust_remote_code",
+                        )
+                        if key in kwargs
+                    }
+                    config = AutoConfig.from_pretrained(
+                        pretrained_model_name_or_path, **config_kwargs
+                    )
+                except Exception:
+                    raise tokenizer_error
+
+            if getattr(config, "model_type", None) != "deepseek_v3":
+                raise tokenizer_error
+
+            # Only DeepSeek failures use these private Transformers registries.
+            # Transformers 5.12.1 still ships both entries, but their API may
+            # change in 5.13. TODO: remove this patch once they disappear.
+            # https://github.com/NVIDIA-NeMo/RL/issues/2764
+            assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+                f"transformers {transformers.__version__} detected. "
+                "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+                "Check if the upstream fix now applies and remove this patch if so."
+            )
+
+            # Import private registries lazily so unrelated tokenizer paths do
+            # not depend on their availability.
+            from transformers.models.auto.tokenization_auto import (
+                MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+                TOKENIZER_MAPPING_NAMES,
+            )
+
             MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
             TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
             return _original_from_pretrained(
