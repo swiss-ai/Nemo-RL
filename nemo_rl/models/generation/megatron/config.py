@@ -45,6 +45,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
+    max_requests: NotRequired[int]
     max_model_len: int
 
     # None disables CUDA-graph bucket construction; -1 selects automatic
