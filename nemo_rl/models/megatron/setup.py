@@ -2569,16 +2569,14 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        with torch.no_grad():
-            load_checkpoint(
-                state,
-                model,
-                optimizer,
-                scheduler,
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and megatron_cfg.dist.use_torch_fsdp2,
-            )
+        load_checkpoint(
+            state,
+            model,
+            optimizer,
+            scheduler,
+            checkpointing_context=checkpointing_context,
+            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
+        )
         print("Checkpoint loaded")
 
         # See _force_sync_optimizer_fp32_from_model: required when
@@ -2824,17 +2822,15 @@ def setup_reference_model_state(
         if should_load_checkpoint:
             if pre_load_checkpoint_hook is not None:
                 pre_load_checkpoint_hook(ref_state, reference_model)
-            # Checkpoint loading modifies views created outside grad mode.
-            with torch.no_grad():
-                load_checkpoint(
-                    ref_state,
-                    reference_model,
-                    None,  # no optimizer
-                    None,  # no scheduler
-                    checkpointing_context=ref_ckpt_context,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and megatron_cfg.dist.use_torch_fsdp2,
-                )
+            load_checkpoint(
+                ref_state,
+                reference_model,
+                None,  # no optimizer
+                None,  # no scheduler
+                checkpointing_context=ref_ckpt_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
 
         reference_state_dict = {}
 

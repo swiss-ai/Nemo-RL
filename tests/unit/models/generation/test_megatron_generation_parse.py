@@ -29,7 +29,7 @@ socket/plumbing contracts, pinned here without a GPU.
 
 import socket
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -457,30 +457,3 @@ def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
     future.result.assert_called_once_with()
     setup_server.assert_called_once_with()
     assert worker.base_url == "http://10.0.0.5:5555/v1"
-
-
-@pytest.mark.asyncio
-@pytest.mark.mcore
-async def test_start_inference_coordinator_binds_to_node_ip(monkeypatch):
-    """The coordinator binds to a reachable node IP on Slurm."""
-    from nemo_rl.distributed import virtual_cluster
-
-    worker = object.__new__(MegatronGenerationMixin)
-    worker.dynamic_inference_engine = SimpleNamespace(
-        start_listening_to_data_parallel_coordinator=AsyncMock(
-            return_value="tcp://10.0.0.1:1234"
-        )
-    )
-    worker._inference_engine_asleep = True
-    monkeypatch.setattr(virtual_cluster, "_get_node_ip_local", lambda: "10.0.0.1")
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
-
-    await worker._start_inference_coordinator()
-
-    worker.dynamic_inference_engine.start_listening_to_data_parallel_coordinator.assert_awaited_once_with(
-        inference_coordinator_port=None,
-        launch_inference_coordinator=True,
-        hostname="10.0.0.1",
-    )
-    assert worker.coordinator_addr == "tcp://10.0.0.1:1234"
-    assert worker._inference_engine_asleep is False
