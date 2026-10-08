@@ -627,9 +627,12 @@ class MegatronGenerationMixin:
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
         self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=None,
             launch_inference_coordinator=True,
+            hostname=_get_node_ip_local(),
         )
         if torch.distributed.get_rank() == 0:
             from megatron.core.inference.inference_client import InferenceClient
