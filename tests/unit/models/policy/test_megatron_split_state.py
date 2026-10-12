@@ -1,4 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Modifications Copyright (c) 2026, ETH Zurich / EPFL / Swiss AI Initiative.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -89,6 +90,9 @@ def _make_mock_model():
     # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
+    model.config.moe_use_offloading_experts = False
+    model.config.moe_use_inplace_fp8_param = False
+    model.config.moe_offloading_experts_debug_mode = False
     model.config.mtp_num_layers = None  # disable MTP unless a test opts in
     model.config.mtp_grad_scale_func = None
     # Explicit values prevent MagicMock's auto-created attributes from making
@@ -680,6 +684,23 @@ class TestFinish:
         assert w.model.config.param_sync_func is saved_param_sync
         assert w._first_train_step_param_sync_func is None
         assert w._first_train_step_forward_pre_hook_disabled is False
+
+    @pytest.mark.parametrize("local_success", [True, False])
+    def test_offload_cache_invalidation_uses_local_update_success(
+        self, mock_module_symbols, local_success
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w.optimizer.step.return_value = (local_success, 0.5, 0)
+        w._mark_offloaded_fp8_weights_dirty = MagicMock()
+        with patch(
+            f"{WORKER_MOD}.logical_and_across_model_parallel_group",
+            return_value=False,
+        ):
+            w.finish_train_step()
+
+        assert w._mark_offloaded_fp8_weights_dirty.call_count == int(local_success)
 
     def test_keeps_first_step_param_sync_disabled_after_failed_update(
         self, mock_module_symbols
