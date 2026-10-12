@@ -1,4 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Modifications Copyright (c) 2026, ETH Zurich / EPFL / Swiss AI Initiative.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -737,6 +738,8 @@ class MegatronPolicyWorkerImpl(
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
+
+        self._mark_offloaded_fp8_weights_dirty()
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -1175,6 +1178,8 @@ class MegatronPolicyWorkerImpl(
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    if update_successful:
+                        self._mark_offloaded_fp8_weights_dirty()
                     # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
                     # with a per-group dict populated during gradient clipping. Value is
                     # None when clip_grad == 0 or this rank owns no MTP-tagged params
@@ -1971,6 +1976,8 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        if update_successful:
+            self._mark_offloaded_fp8_weights_dirty()
         mtp_grad_norm = (
             self.optimizer.grad_norms_by_group.get("mtp")
             if state["mtp_enabled"]
@@ -2601,6 +2608,41 @@ class MegatronPolicyWorkerImpl(
             teacher_full_payload=teacher_full_payload,
         )
 
+    def _mark_offloaded_fp8_weights_dirty(self) -> None:
+        """Invalidate custom expert FP8 copies after a source-weight write."""
+        model_config = self._get_model_config()
+        if not (
+            getattr(model_config, "moe_use_offloading_experts", False)
+            and getattr(model_config, "moe_use_inplace_fp8_param", False)
+            and not getattr(model_config, "moe_offloading_experts_debug_mode", False)
+        ):
+            return
+        if getattr(
+            model_config, "moe_offloading_mode", "fine-grained"
+        ) == "fine-grained" and not getattr(
+            model_config, "moe_use_extra_fp8_param_storage", False
+        ):
+            raise ValueError(
+                "NeMo-RL FP8 expert offloading requires coarse-grained mode or "
+                "moe_use_extra_fp8_param_storage=True to keep BF16 expert weights "
+                "intact for reference-state swaps and exports."
+            )
+
+        # This optional manager is specific to the CPU expert-offloading Core fork.
+        try:
+            from megatron.core.transformer.moe.experts_offloading_fp8_util import (
+                FP8ExpertsParameterManager,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "CPU FP8 expert offloading was requested, but this Megatron-Core "
+                "build does not provide an importable FP8ExpertsParameterManager. "
+                "Use a compatible expert-offloading Core build."
+            ) from exc
+
+        # Ranks with no local offloaded experts can have no manager or cache entries.
+        FP8ExpertsParameterManager.mark_first_microbatch()
+
     def _apply_state_dict_to_model(
         self,
         source_state_dict: dict,
@@ -2618,6 +2660,7 @@ class MegatronPolicyWorkerImpl(
             raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
                 from source_state_dict; if False, skip such keys.
         """
+        cache_marked_dirty = False
         for state_dict_key, param_or_buf in self.model.state_dict().items():
             if (
                 not isinstance(param_or_buf, torch.Tensor)
@@ -2638,6 +2681,9 @@ class MegatronPolicyWorkerImpl(
                 and param_or_buf.shape == source_value.shape
             ):
                 param_or_buf.copy_(source_value)
+                if not cache_marked_dirty:
+                    self._mark_offloaded_fp8_weights_dirty()
+                    cache_marked_dirty = True
                 continue
 
             # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
