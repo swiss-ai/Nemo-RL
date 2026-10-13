@@ -89,8 +89,10 @@ def _refit_tensor_dtype(
     fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
 ) -> torch.dtype:
     """Preserve the FP32 dtype used by inference-critical MoE router state."""
-    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
-        "e_score_correction_bias"
+    # qb_beta: Apertus 2 quantile-balancing selection offsets (fp32 buffer, like the bias).
+    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] in (
+        "e_score_correction_bias",
+        "qb_beta",
     )
     if is_router_correction_bias and tensor.dtype == torch.float32:
         return tensor.dtype
