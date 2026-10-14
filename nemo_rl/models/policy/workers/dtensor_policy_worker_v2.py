@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import os
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -551,8 +552,12 @@ class DTensorPolicyWorkerV2Impl(
                     warn_if_inf_grad_norm(grad_norm)
 
                     # Update parameters and the non-gradient MoE routing bias.
+                    if self._optimizer_state_on_cpu_outside_step:
+                        self.move_optimizer_to_device("cuda")
                     self.optimizer.step()
                     self._update_moe_gate_bias_if_supported()
+                    if self._optimizer_state_on_cpu_outside_step:
+                        self.move_optimizer_to_device("cpu")
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -1284,7 +1289,9 @@ class DTensorPolicyWorkerV2Impl(
         # than tracking which path offloaded it; move_optimizer_to_device is a no-op
         # when the state is already resident.
         if self.optimizer is not None and not self.cpu_offload:
-            self.move_optimizer_to_device("cuda")
+            self.move_optimizer_to_device(
+                "cpu" if self._optimizer_state_on_cpu_outside_step else "cuda"
+            )
 
         torch.cuda.empty_cache()
 
@@ -1321,6 +1328,19 @@ class DTensorPolicyWorkerV2Impl(
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+
+    @property
+    def _optimizer_state_on_cpu_outside_step(self) -> bool:
+        """Keep optimizer state in host memory except around optimizer.step().
+
+        Set NRL_OFFLOAD_OPTIMIZER_OUTSIDE_STEP=1 (e.g. via dtensor_cfg.env_vars): the state is
+        then not resident on the GPU during forward/backward, at the cost of one host<->device
+        copy of it per optimizer step. Values are moved, never converted.
+        """
+        return (
+            os.environ.get("NRL_OFFLOAD_OPTIMIZER_OUTSIDE_STEP") == "1"
+            and not self.cpu_offload
         )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
