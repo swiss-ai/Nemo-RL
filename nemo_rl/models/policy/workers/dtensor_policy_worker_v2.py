@@ -14,6 +14,7 @@
 
 import gc
 import os
+import time
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -553,11 +554,27 @@ class DTensorPolicyWorkerV2Impl(
 
                     # Update parameters and the non-gradient MoE routing bias.
                     if self._optimizer_state_on_cpu_outside_step:
+                        t_start = time.perf_counter()
+                        torch.cuda.empty_cache()
                         self.move_optimizer_to_device("cuda")
+                        t_onload = time.perf_counter()
                     self.optimizer.step()
                     self._update_moe_gate_bias_if_supported()
                     if self._optimizer_state_on_cpu_outside_step:
+                        torch.cuda.synchronize()
+                        t_step = time.perf_counter()
                         self.move_optimizer_to_device("cpu")
+                        timings = (
+                            t_onload - t_start,
+                            t_step - t_onload,
+                            time.perf_counter() - t_step,
+                        )
+                        if self.rank == 0 or sum(timings) > 10:
+                            print(
+                                f"[optimizer-offload] rank {self.rank}: to GPU {timings[0]:.1f}s, "
+                                f"step {timings[1]:.1f}s, to CPU {timings[2]:.1f}s",
+                                flush=True,
+                            )
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -1344,10 +1361,50 @@ class DTensorPolicyWorkerV2Impl(
         )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
+        if self._optimizer_state_on_cpu_outside_step:
+            self._move_optimizer_state_pinned(to_cpu=torch.device(device).type == "cpu")
+            return
         for state in self.optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, (DTensor, torch.Tensor)):
                     state[k] = v.to(device)
+
+    def _move_optimizer_state_pinned(self, to_cpu: bool) -> None:
+        """Move optimizer state between the GPU and pinned host buffers allocated once.
+
+        With NRL_OFFLOAD_OPTIMIZER_OUTSIDE_STEP the whole state makes this round trip every
+        step. Allocating fresh pageable host memory for it each time left some ranks minutes
+        behind the others, so the host copies are pinned buffers created on the first offload
+        and reused afterwards, and the transfers are asynchronous DMA. Scalar entries (AdamW's
+        step counter) stay where they are.
+        """
+        buffers = self.__dict__.setdefault("_pinned_optimizer_state", {})
+        for param, state in self.optimizer.state.items():
+            for k, v in state.items():
+                if not isinstance(v, torch.Tensor) or v.dim() == 0:
+                    continue
+                local = v.to_local() if isinstance(v, DTensor) else v
+                if not to_cpu:
+                    if local.device.type == "cpu":
+                        state[k] = v.to("cuda", non_blocking=True)
+                    continue
+                if local.device.type == "cpu":
+                    continue
+                buf = buffers.get((id(param), k))
+                if buf is None:
+                    pinned = torch.empty(
+                        local.shape, dtype=local.dtype, device="cpu", pin_memory=True
+                    )
+                    buf = (
+                        DTensor(pinned, v._spec, requires_grad=False)
+                        if isinstance(v, DTensor)
+                        else pinned
+                    )
+                    buffers[(id(param), k)] = buf
+                host = buf.to_local() if isinstance(buf, DTensor) else buf
+                host.copy_(local, non_blocking=True)
+                state[k] = buf
+        torch.cuda.synchronize()
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
