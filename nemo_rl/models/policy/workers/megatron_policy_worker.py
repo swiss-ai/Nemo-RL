@@ -4615,6 +4615,16 @@ class MegatronPolicyWorkerImpl(
             if not is_training:
                 self.model.train()
 
+            # Release what the save built, as Bridge's load path does after loading:
+            # the sharded state dict can own tensors distinct from the parameters and
+            # optimizer state, and it is left to the cyclic garbage collector. With the
+            # optimizer state on the GPU (md_decoupling) 6-12 GiB per GPU stayed
+            # allocated into the next training step and ran it out of memory.
+            self._log_gpu_mem("ckpt_save_exit")
+            gc.collect()
+            torch.cuda.empty_cache()
+            self._log_gpu_mem("ckpt_save_exit_after_gc")
+
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
             raise
