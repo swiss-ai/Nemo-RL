@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import sys
 import time
 import warnings
 from collections import OrderedDict, defaultdict
@@ -1529,6 +1530,66 @@ class MegatronPolicyWorkerImpl(
             total_b / gib,
         )
         torch.cuda.reset_peak_memory_stats(dev)
+
+    def _log_optimizer_state_holders(self, tag: str) -> None:
+        """Log what besides the optimizer refers to its largest state tensor.
+
+        After a checkpoint save the optimizer-state tensors a rank wrote stayed
+        referenced from somewhere outside the optimizer, and garbage collection
+        did not release them. This names the referrers of the largest state
+        tensor and counts the other tensors sharing its storage, so the holder
+        can be read from the log. Run with ``NRL_LOG_LEVEL=DEBUG`` to turn it on.
+
+        Args:
+            tag: Phase-boundary name this sample belongs to.
+        """
+        if self.optimizer is None or not log.isEnabledFor(logging.DEBUG):
+            return
+        if isinstance(self.optimizer, ChainedOptimizer):
+            optimizer_state = self.optimizer.state
+        else:
+            optimizer_state = self.optimizer._get_state()
+        state_dicts = [state for _, state in optimizer_state.items()]
+        tensors = [v for s in state_dicts for v in s.values() if torch.is_tensor(v)]
+        if not tensors:
+            return
+        target = max(tensors, key=lambda v: v.numel())
+        ptr = target.untyped_storage().data_ptr()
+        aliases = []
+        for obj in gc.get_objects():
+            try:
+                if (
+                    torch.is_tensor(obj)
+                    and obj is not target
+                    and obj.untyped_storage().data_ptr() == ptr
+                ):
+                    aliases.append(obj)
+            except Exception:
+                pass
+        candidates = [target, *aliases]
+        own = {id(state_dicts), id(tensors), id(aliases), id(candidates)}
+        own.update(id(s) for s in state_dicts)
+        referrers = []
+        for t in candidates:
+            for ref in gc.get_referrers(t):
+                if id(ref) in own or ref is sys._getframe():
+                    continue
+                if hasattr(ref, "f_code"):
+                    referrers.append(f"frame:{ref.f_code.co_qualname}")
+                elif isinstance(ref, dict):
+                    keys = [str(k)[:40] for k in list(ref.keys())[:3]]
+                    referrers.append(f"dict(n={len(ref)},keys={keys})")
+                else:
+                    referrers.append(type(ref).__qualname__)
+        log.debug(
+            "[ckpt_holders] tag=%s rank=%d numel=%d device=%s aliases=%d referrers=%s",
+            tag,
+            self.rank,
+            target.numel(),
+            target.device,
+            len(aliases),
+            referrers[:20],
+        )
 
     def _restore_saved_mcore_hooks(self, state: dict[str, Any]) -> None:
         """Restore the mcore hooks nulled in ``begin_train_step``.
@@ -4570,7 +4631,15 @@ class MegatronPolicyWorkerImpl(
                 and self.optimizer is not None
                 and not self.optimizer_cpu_offload
             ):
-                self.move_optimizer("cuda")
+                # The torch_dist save leaves every optimizer-state tensor a rank wrote
+                # referenced past the save. On the GPU the next offload then could not
+                # free them (6-12 GiB per GPU with md_decoupling) and the next training
+                # step ran out of memory. When the state goes to the CPU before every
+                # logprob pass anyway, save it from there; prepare_for_training brings
+                # it back as new GPU tensors and the held copies stay in host memory.
+                self.move_optimizer(
+                    "cpu" if self.offload_optimizer_for_logprob else "cuda"
+                )
             torch.cuda.synchronize()
 
             self.mcore_state.cfg.checkpoint.save = weights_path
@@ -4615,12 +4684,12 @@ class MegatronPolicyWorkerImpl(
             if not is_training:
                 self.model.train()
 
-            # Release what the save built, as Bridge's load path does after loading:
-            # the sharded state dict can own tensors distinct from the parameters and
-            # optimizer state, and it is left to the cyclic garbage collector. With the
-            # optimizer state on the GPU (md_decoupling) 6-12 GiB per GPU stayed
-            # allocated into the next training step and ran it out of memory.
             self._log_gpu_mem("ckpt_save_exit")
+            if self.rank == 0:
+                try:
+                    self._log_optimizer_state_holders("ckpt_save_exit")
+                except Exception as e:
+                    log.debug("[ckpt_holders] failed: %r", e)
             gc.collect()
             torch.cuda.empty_cache()
             self._log_gpu_mem("ckpt_save_exit_after_gc")
