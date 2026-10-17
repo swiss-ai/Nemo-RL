@@ -1395,8 +1395,12 @@ async def run_sample_multi_turn_rollout(
                 )
 
         except Exception as e:
+            # Re-raise: a swallowed error leaves the sample with no response and
+            # reward 0, so a generation backend that fails every request trains on
+            # empty rollouts instead of stopping (async GRPO's
+            # max_generation_failures only sees errors that propagate).
             print(f"Error generating response for sample {sample_idx}: {e}")
-            break
+            raise
 
         # Create single-sample batch for environment interaction
         sample_batch = BatchedDataDict[DatumSpec](
