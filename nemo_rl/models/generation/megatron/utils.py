@@ -20,6 +20,19 @@ from megatron.core.inference.config import ImageProcessingConfig, VideoProcessin
 from megatron.core.inference.utils import device_memory_summary
 
 
+def context_capped_max_new_tokens(
+    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
+) -> int:
+    """Cap generation so the prompt and response fit the engine's max sequence length."""
+    remaining_context = max_model_len - input_length
+    if remaining_context <= 0:
+        raise ValueError(
+            "Cannot generate from an input whose length exhausts the model context: "
+            f"input_length={input_length}, max_model_len={max_model_len}."
+        )
+    return min(configured_max_new_tokens, remaining_context)
+
+
 def sample_vision_tensors(data, index: int):
     """Return one sample's vision tensors from RL PackedTensors."""
     from nemo_rl.data.multimodal_utils import PackedTensor
