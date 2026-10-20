@@ -5448,6 +5448,25 @@ def async_grpo_train(
                         generation_logprobs=train_data["generation_logprobs"],
                         sample_mask=train_data["sample_mask"],
                     )
+
+                    # Compute baseline for logging and log histogram
+                    baseline_for_log, _, _ = calculate_baseline_and_std_per_prompt(
+                        prompt_ids_for_adv,
+                        rewards,
+                        torch.ones_like(rewards),
+                        leave_one_out_baseline=(
+                            master_config.grpo.adv_estimator.use_leave_one_out_baseline
+                        ),
+                    )
+                    _log_mixed_rewards_and_advantages_information(
+                        logger=logger,
+                        total_steps=step,
+                        metrics=rollout_metrics,
+                        baseline=baseline_for_log.detach().float().cpu(),
+                        advantages=train_data["advantages"].detach().float().cpu(),
+                    )
+                    del baseline_for_log
+
                     if (
                         hasattr(adv_estimator, "last_metrics")
                         and adv_estimator.last_metrics
