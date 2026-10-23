@@ -44,7 +44,13 @@ policy:
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
   dtensor_cfg:
+    _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -77,6 +83,9 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -88,6 +97,7 @@ policy:
     num_layers_in_last_pipeline_stage: null
     sequence_parallel: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     optimizer:
       optimizer: "adam"
@@ -115,6 +125,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -220,3 +231,8 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null

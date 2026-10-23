@@ -28,7 +28,7 @@ def mock_registry():
     """Create a mock registry with various actor types."""
     return {
         "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "uv run --group vllm",
-        "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "uv run --group vllm",
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "uv run --group vllm",
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "uv run --group mcore",
         "nemo_rl.environments.math_environment.MathEnvironment": "python",
         "nemo_rl.environments.code_environment.CodeEnvironment": "python",
@@ -67,7 +67,7 @@ class TestPrefetchVenvs:
                 in actor_fqns
             )
             assert (
-                "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
                 in actor_fqns
             )
             assert (
@@ -158,7 +158,7 @@ class TestPrefetchVenvs:
             actor_fqns = [args[1] for args in call_args]
 
             assert (
-                "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
                 in actor_fqns
             )
             assert (
@@ -270,3 +270,37 @@ class TestPrefetchVenvs:
             assert "Venv prefetching complete! Summary:" in captured.out
             assert "Prefetched: 2" in captured.out
             assert "Failed: 1" in captured.out
+
+    def test_prefetch_venvs_returns_the_failed_actors(self, prefetch_venvs_func):
+        """A failed venv is reported to the caller, not just printed.
+
+        This runs during the image build. Before this returned anything, a venv
+        that failed to build was printed in the summary and then swallowed, so
+        the build went green and the actor only died the first time someone
+        launched it.
+        """
+        with patch(
+            "nemo_rl.utils.prefetch_venvs.create_local_venv"
+        ) as mock_create_venv:
+            mock_create_venv.side_effect = [
+                Exception("Test error"),
+                "/path/to/venv/bin/python",
+                "/path/to/venv/bin/python",
+            ] * CALL_MULTIPLIER
+
+            failed = prefetch_venvs_func(filters=None)
+
+        assert failed == [
+            "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
+        ]
+
+    def test_prefetch_venvs_returns_empty_when_all_succeed(self, prefetch_venvs_func):
+        """The success path must stay falsy, or every build would fail."""
+        with patch(
+            "nemo_rl.utils.prefetch_venvs.create_local_venv"
+        ) as mock_create_venv:
+            mock_create_venv.return_value = "/path/to/venv/bin/python"
+
+            failed = prefetch_venvs_func(filters=None)
+
+        assert failed == []

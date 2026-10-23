@@ -71,10 +71,10 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
 
     ```yaml
     tokenizer:
-    custom_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
+      chat_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
     ```
 
-By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.), you can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
+By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [NuminaMath-1.5](../../nemo_rl/data/datasets/response_datasets/numinamath.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.), you can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
@@ -138,14 +138,142 @@ data:
     ...
 ```
 
+`AIME2025` and `AIME2026` are registered alongside `AIME2024` and accept the same config keys (e.g. `repeat`), so any of them can drop into the `validation:` list above.
+
+### Custom datasets defined outside NeMo RL
+
+If you want to plug in a dataset class that lives outside the `nemo_rl`
+package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec` and `set_processor`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
-[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+This works for any dataset class that calls `split_train_validation` in its `__init__` — which today includes most built-in datasets, among them [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), and [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py).
+A dataset class that does not call it ignores `split_validation_size`; the dataset dispatcher emits a warning in that case, so a misconfigured run is not silent.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
 ```python
 # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
 self.val_dataset = None
 self.split_train_validation(split_validation_size, seed)
 ```
+
+### Energon Multimodal Datasets
+
+The optional Energon SFT backend reads prepared WebDataset shards while the existing Hugging Face backend remains the default. `megatron-energon` ships in the `mcore` extra, and the Megatron policy workers pick that environment up from `ACTOR_ENVIRONMENT_REGISTRY`, so the driver runs under a plain `uv run`:
+
+```bash
+uv run examples/run_sft_v2.py \
+  --config examples/configs/recipes/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.yaml
+```
+
+Each shard sample contains a JSON payload and its media members. The JSON payload uses one complete conversation as the sampling unit:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "image", "media_index": 0},
+      {"type": "text", "text": "Compare with the next image."},
+      {"type": "image", "media_index": 1}
+    ]},
+    {"role": "assistant", "content": "The second image is brighter."}
+  ],
+  "media": [
+    {"type": "image", "member": "000001.first.jpg"},
+    {"type": "image", "member": "000001.second.jpg"}
+  ],
+  "tools": null
+}
+```
+
+Media references must appear exactly once and in manifest order. Multi-turn conversations, assistant tool calls, matching tool results, and the final assistant response remain in the same sample. Tool results must reference an earlier tool-call ID.
+
+Configure the prepared dataset path and split as follows:
+
+```yaml
+sft:
+  # SFTv2 has no validation loop; the exemplar defaults (val_period: 10,
+  # val_at_start: true) are rejected at startup.
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+data:
+  _override_: true              # replace the exemplar's HF data block wholesale
+  backend: energon
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  energon:
+    model_family: qwen          # required, no default: "qwen" or "nemotron"
+    num_workers: 8
+    shuffle_buffer_size: 1000
+    processor_adapter: hf_multimodal
+    packing_buffer_size: null
+  train:
+    path: /path/to/prepared/energon/dataset
+    split: train
+    virtual_epoch_length: 1000  # batches per virtual epoch
+  validation: null              # SFTv2 builds a train loader only
+data_plane:                     # required by run_sft_v2.py
+  enabled: true
+  impl: local
+  max_partitions: 2
+```
+
+`model_family` and the top-level `data_plane` block have no defaults and are not
+supplied by any exemplar config, so both must be set explicitly. The `sft`
+overrides are needed for a different reason: SFTv2 runs no validation pass, so it
+rejects `val_period`, `val_at_start` or `val_at_end` left at their exemplar
+values, and `data.validation` must be null — the loader is always built with
+`split_role="train"`.
+
+The processor runs inside Energon loader workers and returns the same tokenized `message_log` representation as the Hugging Face path, including model inputs such as Qwen3-VL grid metadata or Nano Omni image sizes and frame counts. `prepare_sft_batch` creates the assistant loss mask, flattens the messages, and pads the batch without checking which loader produced it.
+
+The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
+
+To let Energon form model-ready multimodal packs, set the packing buffer and
+enable fused sequence packing:
+
+```yaml
+policy:
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+    algorithm: balanced_greedy_knapsack
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    max_sequences_per_bin: 16  # optional conversation limit per physical pack
+data:
+  energon:
+    packing_buffer_size: 64    # enables Energon-owned packing
+    max_samples_per_sequence: null  # optional shard read-order control
+```
+
+Both config blocks are required because Energon builds the packs while the
+policy block selects and configures the packer. `max_sequences_per_bin` limits
+the conversations placed in one pack. The similarly named
+`max_samples_per_sequence` controls how many consecutive samples Energon reads
+from one shard; it does not affect pack layout.
+
+Without an Energon packing buffer, SFTv2 currently requires fixed batching.
+Dynamic batching and HybridEP flex dispatch are not supported with
+Energon-owned packs.
+
+With Energon-owned packing, each `sample_mask` entry represents one physical
+pack, so `num_valid_samples` counts non-empty packs rather than source
+conversations. NLL loss scaling is unchanged because it is normalized by
+`global_valid_toks`.
+
+Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
 
 ### OpenAI Format Datasets (with Tool Calling Support)
 
@@ -241,110 +369,13 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 
 ## LoRA Configuration
 
-NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, including Nano‑v3 models. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
-
-Notes:
-- LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
-- Triton kernels are only used in the DTensor v2 path. For `tensor_parallel_size > 1`, Automodel currently does not support Triton kernels (see note below).
-
-### DTensor Configuration Parameters
-
-The LoRA configuration is specified under the `policy.dtensor_cfg.lora_cfg` section:
-
-```yaml
-policy:
-  dtensor_cfg:
-    lora_cfg:
-      enabled: False            # Set to True to enable LoRA fine-tuning
-      target_modules: []        # List of module names to apply LoRA
-      exclude_modules: []       # List of module names to exclude from LoRA
-      match_all_linear: true    # Apply LoRA to all linear layers
-      dim: 8                    # LoRA rank (r): controls adaptation capacity
-      alpha: 32                 # LoRA scaling factor (effective lr = alpha/dim)
-      dropout: 0.0              # Dropout probability for LoRA layers
-      dropout_position: "post"  # Dropout position: "pre" or "post"
-      lora_A_init: "xavier"     # Initialization method: "xavier" or "uniform"
-      use_triton: true          # Use Triton-optimized kernels (DTensor v2 path)
-```
-
-### DTensor (Automodel) Parameter Details
-- **`enabled`** (bool): Whether to enable LoRA training
-- **`target_modules`** (list): Specific module names to apply LoRA. Empty with `match_all_linear=true` applies to all linear layers
-- **`exclude_modules`** (list): Module names to exclude from LoRA
-- **`match_all_linear`** (bool): When `true`, applies LoRA to all linear layers (overrides `target_modules`)
-- **`dim`** (int): LoRA rank (r). Lower values = fewer parameters but less capacity. Typical: 4, 8, 16, 32, 64
-- **`alpha`** (int): LoRA scaling factor. Effective learning rate multiplier = `alpha/dim`. Typical: 16, 32, 64
-- **`dropout`** (float): Dropout probability for regularization
-- **`dropout_position`** (str): Apply dropout before ("pre") or after ("post") LoRA
-- **`lora_A_init`** (str): Initialization method for LoRA A matrix
-- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for DTensor v2 only. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues
-
-### DTensor Example Usage
+NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning of SFT models, including Nano‑v3 models, on both the DTensor and Megatron backends. To enable LoRA for SFT on the default DTensor backend:
 
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
-For the Nano‑v3 SFT LoRA recipe, see:[sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
 
-### Megatron Configuration Parameters
-
-The LoRA configuration is specified under the `policy.megatron_cfg.peft` section:
-
-```yaml
-policy:
-  megatron_cfg:
-    peft:
-      enabled: false                # Set to True to enable LoRA fine-tuning
-      target_modules: []            # List of module names to apply LoRA, defaults to all linear layers
-      exclude_modules: []           # List of module names not to apply LoRa.
-      dim: 32                       # LoRA rank (r): controls adaptation capacity
-      alpha: 32                     # LoRA scaling factor (effective lr = alpha/dim)
-      dropout: 0.0                  # Dropout probability for LoRA layers
-      dropout_position: "pre"       # Dropout position: "pre" or "post"
-      lora_A_init_method: "xavier"  # Initialization method for lora A: "xavier" or "uniform"
-      lora_B_init_method: "zero"    # Initialization method for lora B: "zero"
-      a2a_experimental: false       # Enables the experimental All-to-All (A2A) communication strategy.
-      lora_dtype: None              # Weight's dtype
-```
-
-### Megatron Parameter Details
-- **`enabled`** (bool): Whether to enable LoRA training
-- **`target_modules`** (list): Specific module names to apply LoRA. Defaults to all linear layers if the list is left empty. Example: ['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2'].
-  - 'linear_qkv': Apply LoRA to the fused linear layer used for query, key, and value projections in self-attention.
-  - 'linear_proj': Apply LoRA to the linear layer used for projecting the output of self-attention.
-  - 'linear_fc1': Apply LoRA to the first fully-connected layer in MLP.
-  - 'linear_fc2': Apply LoRA to the second fully-connected layer in MLP.
-  Target modules can also contain wildcards. For example, you can specify target_modules=['*.layers.0.*.linear_qkv', '*.layers.1.*.linear_qkv'] to add LoRA to only linear_qkv on the first two layers.
-- **`exclude_modules`** (List[str], optional): A list of module names not to apply LoRa. It will match all nn.Linear & nn.Linear-adjacent modules whose name does not match any string in exclude_modules. If used, will require target_modules to be empty list or None.
-- **`dim`** (int): LoRA rank (r). Lower values = fewer parameters but less capacity. Typical: 4, 8, 16, 32, 64
-- **`alpha`** (int): LoRA scaling factor. Effective learning rate multiplier = `alpha/dim`. Typical: 16, 32, 64
-- **`dropout`** (float): Dropout probability for regularization, defaults to 0.0
-- **`dropout_position`** (str): Apply dropout before ("pre") or after ("post") LoRA
-- **`lora_A_init`** (str): Initialization method for lora_A (choices: ['xavier', 'uniform']), defaults to xavier.
-- **`lora_B_init`** (str): Initialization method for the low-rank matrix B. Defaults to "zero".
-- **`a2a_experimental`** (bool): Enables the experimental All-to-All (A2A) communication strategy. Defaults to False.
-- **`lora_dtype`** (torch.dtype): Weight's dtype, by default will use orig_linear's but if they are quantized weights (e.g. 4bit) needs to be specified explicitly.
-
-### Megatron Example Usage
-The config uses DTensor by default, so the megatron backend needs to be explicitly enabled. 
-```sh
-uv run examples/run_sft.py \
-  --config examples/configs/sft.yaml \
-  policy.dtensor_cfg.enabled=false \
-  policy.megatron_cfg.enabled=true \
-  policy.megatron_cfg.peft.enabled=true
-```
-
-For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
-
-### Exporting a LoRA Checkpoint to Hugging Face Format
-
-After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports two export modes:
-
-- **Merged**: fold the adapter into the base model and export a single standalone HuggingFace checkpoint for inference or evaluation.
-- **Adapter-only**: export only the adapter weights in HuggingFace PEFT format, keeping the base model separate (e.g. for use with vLLM's LoRA support).
-
-See the [Checkpointing documentation](../design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details and examples.
+For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, example recipes, and Hugging Face export — see the dedicated [LoRA guide](lora.md).
 
 ## Optimizations
 
@@ -365,12 +396,12 @@ Add the following to your Megatron config in your YAML file:
 policy:
   megatron_cfg:
     enabled: true
-    use_linear_ce_fusion_loss: true
-    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+    use_fused_linear_logprobs: true
+    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
 ```
 
 **Notes:**
 
-- This optimization applies to SFT training with `NLLLoss` and DPO training. See the [DPO guide](dpo.md#chunked-linear-cross-entropy-fusion-loss) for DPO-specific details.
-- Context parallelism is not supported when linear CE fusion is enabled.
-- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
+- This optimization applies to SFT training with `NLLLoss` and DPO training. See the [DPO guide](dpo.md#chunked-fused-linear-logprobs) for DPO-specific details.
+- Context parallelism is not supported when fused linear logprobs are enabled.
+- The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.

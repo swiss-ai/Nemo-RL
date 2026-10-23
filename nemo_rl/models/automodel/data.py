@@ -14,14 +14,18 @@
 
 """Data processing utilities for automodel training and inference."""
 
+import inspect
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional, Tuple
+from functools import cache
+from typing import Any, Iterable, Iterator, Optional, Tuple
 
 import torch
+from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -29,12 +33,67 @@ from nemo_rl.models.huggingface.common import (
 )
 
 
+@cache
+def _accepted_forward_kwargs(
+    model_type: type[nn.Module],
+) -> Optional[frozenset[str]]:
+    """Return explicit ``forward`` kwargs, or ``None`` when all kwargs are accepted."""
+    try:
+        parameters = inspect.signature(model_type.forward).parameters.values()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return None
+    return frozenset(
+        parameter.name for parameter in parameters if parameter.name != "self"
+    )
+
+
+def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:
+    """Return True if every image in the batch has the same (height, width)."""
+    if imgs_sizes.ndim != 2 or imgs_sizes.shape[0] <= 1:
+        return True
+    return bool((imgs_sizes == imgs_sizes[0]).all())
+
+
+def filter_multimodal_kwargs_for_model(
+    model: nn.Module, multimodal_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop processor metadata that is not accepted by an AutoModel forward."""
+    accepted_kwargs = _accepted_forward_kwargs(type(model))
+    if accepted_kwargs is None:
+        return multimodal_kwargs
+    # AutoModel materializes pixels with pad_to_max_shape. A forward that cannot
+    # consume imgs_sizes cannot crop that padding, so mixed-resolution batches
+    # would mismatch the placeholder count. This is
+    # the AutoModel Nemotron Omni path (nvidia/Nemotron-3-Nano-Omni-30B-A3B-
+    # Reasoning-BF16), whose HF forward takes pixel_values but not imgs_sizes,
+    # unlike mcore, which consumes native-resolution pre-patchified pixels.
+    imgs_sizes = multimodal_kwargs.get("imgs_sizes")
+    if (
+        imgs_sizes is not None
+        and "imgs_sizes" not in accepted_kwargs
+        and not _all_image_sizes_equal(imgs_sizes)
+    ):
+        raise ValueError(
+            "This AutoModel does not accept `imgs_sizes` and cannot crop padded "
+            "pixel_values, but the batch contains mixed-resolution images. The "
+            "AutoModel backend only supports equal-resolution images/tiles; use "
+            "the Megatron backend for mixed-resolution inputs."
+        )
+    return {
+        key: value for key, value in multimodal_kwargs.items() if key in accepted_kwargs
+    }
+
+
 @dataclass
 class ProcessedInputs:
     """Processed microbatch inputs ready for model forward pass.
 
-    This structure contains all necessary tensors and metadata for a forward pass,
-    including context parallel buffers and flash attention configuration.
+    This structure contains the canonical tensors and metadata needed to prepare
+    a model forward, including flash-attention configuration. Context-parallel
+    state is owned by Automodel's per-microbatch sharder.
     """
 
     # Core inputs (always present)
@@ -50,15 +109,6 @@ class ProcessedInputs:
 
     # Multimodal (VLM) inputs
     vlm_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    # Context parallel support (cp_size > 1)
-    cp_buffers: list[torch.Tensor] = field(default_factory=list)
-    seq_index: Optional[torch.Tensor] = None
-
-    @property
-    def has_context_parallel(self) -> bool:
-        """Check if context parallel is enabled."""
-        return len(self.cp_buffers) > 0
 
     @property
     def has_flash_attention(self) -> bool:
@@ -99,7 +149,6 @@ def make_processed_microbatch_iterator(
     raw_iterator: Iterator[BatchedDataDict[Any]],
     tokenizer: AutoTokenizer,
     cfg: dict[str, Any],
-    cp_size: int,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -111,7 +160,6 @@ def make_processed_microbatch_iterator(
         raw_iterator: Iterator yielding raw BatchedDataDict microbatches
         tokenizer: Tokenizer for processing
         cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
-        cp_size: Context parallel size
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -130,7 +178,6 @@ def make_processed_microbatch_iterator(
             tokenizer,
             enable_seq_packing,
             cfg,
-            cp_size,
         )
 
         yield ProcessedMicrobatch(
@@ -147,7 +194,6 @@ def get_microbatch_iterator(
     mbs: int,
     dp_mesh: Any,  # noqa: ARG001
     tokenizer: AutoTokenizer,
-    cp_size: int = 1,
 ) -> tuple[Iterator[ProcessedMicrobatch], int]:
     """Create processed microbatch iterator based on batching strategy.
 
@@ -157,7 +203,6 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         dp_mesh: Data parallel mesh
         tokenizer: Tokenizer for processing
-        cp_size: Context parallel size
 
     Returns:
         Tuple of (processed_microbatch_iterator, iterator_length)
@@ -192,7 +237,6 @@ def get_microbatch_iterator(
         itertools.chain(mb_iterator, dummy_iterator),
         tokenizer,
         cfg,
-        cp_size,
     )
     return processed_iterator, iterator_len
 
@@ -202,7 +246,6 @@ def process_microbatch(
     tokenizer: AutoTokenizer,
     enable_seq_packing: bool,
     cfg: dict[str, Any],
-    cp_size: int,
 ) -> ProcessedInputs:
     """Process a microbatch and prepare inputs for model forward.
 
@@ -211,7 +254,6 @@ def process_microbatch(
         tokenizer: Tokenizer for padding value
         enable_seq_packing: Whether sequence packing is enabled
         cfg: Configuration dictionary
-        cp_size: Context parallel size
 
     Returns:
         ProcessedInputs containing all tensors and metadata for forward pass
@@ -256,7 +298,9 @@ def process_microbatch(
         flash_attn_kwargs = {}
 
     # Add vlm kwargs to model call
-    vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+    vlm_kwargs = mb.get_multimodal_dict(
+        True, input_ids.device, None, "pad_to_max_shape"
+    )
     if len(vlm_kwargs) > 0:
         # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
         position_ids = None
@@ -267,30 +311,12 @@ def process_microbatch(
             "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
         )
 
-    # Prepare context parallel buffers if needed
-    cp_buffers = []
-    seq_index = None
-    if cp_size > 1:
-        assert len(vlm_kwargs) == 0, (
-            f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
-        )
-        # CP doesn't support attention_mask — torch's CP SDPA handler requires
-        # is_causal=True (no explicit mask). Passing an unsplit mask causes a
-        # DTensor redistribution assertion because the mask isn't in cp_buffers
-        # and therefore keeps the full sequence length while Q/K/V are split.
-        # Matches Automodel's cp_utils.py which does batch.pop("attention_mask").
-        attention_mask = None
-        seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
-        cp_buffers = [input_ids, position_ids, seq_index]
-
     return ProcessedInputs(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         flash_attn_kwargs=flash_attn_kwargs,
         vlm_kwargs=vlm_kwargs,
-        cp_buffers=cp_buffers,
-        seq_index=seq_index,
         seq_len=seq_len,
     )
 
@@ -348,7 +374,11 @@ def process_global_batch(
     }
 
 
-def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
+def check_sequence_dim(
+    data: BatchedDataDict[Any],
+    *,
+    skip_keys: Optional[Iterable[str]] = None,
+) -> Tuple[int, int]:
     """Check and validate sequence dimension across all tensors.
 
     Verifies that dimension 1 is the sequence dimension for all tensors
@@ -356,6 +386,10 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
 
     Args:
         data: BatchedDataDict to validate
+        skip_keys: Keys whose tensors are not student-sequence-aligned at
+            dim 1 and should be excluded from the check (e.g. cross-tokenizer
+            teacher and alignment auxiliaries that ride along on the same
+            BatchedDataDict).
 
     Returns:
         Tuple of (sequence_dim, seq_dim_size)
@@ -363,9 +397,21 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
     Raises:
         AssertionError: If any tensor has inconsistent sequence dimension
     """
+    skip_set = set(skip_keys) if skip_keys is not None else set()
     sequence_dim = 1
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
-    for _, v in data.items():
+    for k, v in data.items():
+        if k in skip_set:
+            continue
+        # Multimodal fields are never sequence-aligned: dim 1 is
+        # num_images / num_patches. In-memory these ride as
+        # ``PackedTensor`` and are skipped by ``torch.is_tensor`` below, but
+        # the data-plane wire form is a nested tensor, so name it here.
+        # Mirrors ``megatron/data.py::get_and_validate_seqlen``; kept inside
+        # this helper rather than pushed onto ``skip_keys`` because all seven
+        # call sites need it and none of them should know the wire format.
+        if k in PACKED_MULTIMODAL_FIELDS:
+            continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"

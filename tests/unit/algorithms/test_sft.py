@@ -19,7 +19,69 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.loss import NLLLossFn
-from nemo_rl.algorithms.sft import MasterConfig, _default_sft_save_state, sft_train
+from nemo_rl.algorithms.sft import (
+    MasterConfig,
+    SFTConfig,
+    _get_sft_save_state,
+    _initial_sft_save_state,
+    prepare_sft_batch,
+    sft_train,
+)
+from nemo_rl.data.multimodal_utils import PackedTensor
+
+
+def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_sft_save_state({}) == _initial_sft_save_state()
+
+    loaded_state = {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "val:loss": 0.25,
+    }
+
+    save_state = _get_sft_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
+
+
+def test_prepare_sft_batch_accepts_prepared_batch_and_checks_media_rows():
+    tokenizer = MagicMock(pad_token_id=0)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 0]]),
+        "input_lengths": torch.tensor([2]),
+        "token_mask": torch.tensor([[0, 1, 0]]),
+        "sample_mask": torch.tensor([1.0]),
+        "pixel_values": PackedTensor([torch.ones(2, 3)], dim_to_pack=0),
+    }
+
+    prepared = prepare_sft_batch(
+        batch,
+        tokenizer=tokenizer,
+        only_unmask_final=False,
+        make_sequence_length_divisible_by=1,
+    )
+
+    assert prepared["input_ids"].tolist() == [[1, 2, 0]]
+    bad_batch = dict(batch)
+    bad_batch["pixel_values"] = PackedTensor(
+        [torch.ones(2, 3), torch.ones(2, 3)], dim_to_pack=0
+    )
+    with pytest.raises(ValueError, match="2 rows"):
+        prepare_sft_batch(
+            bad_batch,
+            tokenizer=tokenizer,
+            only_unmask_final=False,
+            make_sequence_length_divisible_by=1,
+        )
 
 
 @pytest.fixture
@@ -64,17 +126,17 @@ def mock_components():
 
     # Create mock master config
     master_config = MasterConfig.model_construct(
-        sft={
-            "max_num_steps": 5,
-            "max_num_epochs": 2,
-            "val_period": 100,
-            "val_batches": 1,
-            "val_global_batch_size": 1,
-            "val_micro_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-            "only_unmask_final": False,
-        },
+        sft=SFTConfig.model_construct(
+            max_num_steps=5,
+            max_num_epochs=2,
+            val_period=100,
+            val_batches=1,
+            val_global_batch_size=1,
+            val_micro_batch_size=1,
+            val_at_start=False,
+            val_at_end=False,
+            only_unmask_final=False,
+        ),
         policy={
             "train_global_batch_size": 1,
             "make_sequence_length_divisible_by": 8,
@@ -105,9 +167,9 @@ def mock_components():
 def test_exit_on_max_steps(mock_components):
     """Test that training loop exits when max_num_steps is reached"""
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
-    mock_components["master_config"].sft["max_num_steps"] = 12
+    mock_components["master_config"].sft.max_num_steps = 12
 
-    sft_save_state = _default_sft_save_state()
+    sft_save_state = _initial_sft_save_state()
 
     # Run training
     sft_train(
@@ -124,15 +186,21 @@ def test_exit_on_max_steps(mock_components):
 
     # Verify we only trained for 12 steps.
     assert mock_components["policy"].train.call_count == 12
+    final_timing_call = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ][-1]
+    assert final_timing_call.kwargs["step_finished"] is True
 
 
 def test_exit_on_max_epochs(mock_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
-    mock_components["master_config"].sft["max_num_epochs"] = 2
-    mock_components["master_config"].sft["max_num_steps"] = 100
+    mock_components["master_config"].sft.max_num_epochs = 2
+    mock_components["master_config"].sft.max_num_steps = 100
 
-    sft_save_state = _default_sft_save_state()
+    sft_save_state = _initial_sft_save_state()
 
     # Run training
     sft_train(
@@ -151,16 +219,24 @@ def test_exit_on_max_epochs(mock_components):
     assert mock_components["policy"].train.call_count == 20
 
 
-def test_exit_on_timeout(mock_components, capsys):
+def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
-    mock_components["master_config"].sft["max_num_steps"] = 100
-    mock_components["master_config"].sft["max_num_epochs"] = 10
+    mock_components["master_config"].sft.max_num_steps = 100
+    mock_components["master_config"].sft.max_num_epochs = 10
+    mock_components["master_config"].checkpointing["enabled"] = True
+    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
-    sft_save_state = _default_sft_save_state()
+    sft_save_state = _initial_sft_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.sft.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.sft.torch.save"),
+        patch("nemo_rl.algorithms.sft.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -182,6 +258,12 @@ def test_exit_on_timeout(mock_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_components["policy"].train.call_count == 8
+        assert (
+            mock_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and is near the end (not followed by more training)
         captured = capsys.readouterr()
@@ -206,11 +288,11 @@ def test_exit_on_timeout(mock_components, capsys):
 
 def test_training_with_disabled_validation(mock_components):
     """Test that training works when validation is disabled (val_dataloader=None, val_period<=0)"""
-    mock_components["master_config"].sft["val_period"] = 0
-    mock_components["master_config"].sft["max_num_steps"] = 5
-    mock_components["master_config"].sft["max_num_epochs"] = 1
+    mock_components["master_config"].sft.val_period = 0
+    mock_components["master_config"].sft.max_num_steps = 5
+    mock_components["master_config"].sft.max_num_epochs = 1
 
-    sft_save_state = _default_sft_save_state()
+    sft_save_state = _initial_sft_save_state()
 
     sft_train(
         mock_components["policy"],
@@ -229,11 +311,11 @@ def test_training_with_disabled_validation(mock_components):
 
 def test_training_with_negative_val_period(mock_components):
     """Test that training works when val_period is negative (validation disabled)"""
-    mock_components["master_config"].sft["val_period"] = -1
-    mock_components["master_config"].sft["max_num_steps"] = 3
-    mock_components["master_config"].sft["max_num_epochs"] = 1
+    mock_components["master_config"].sft.val_period = -1
+    mock_components["master_config"].sft.max_num_steps = 3
+    mock_components["master_config"].sft.max_num_epochs = 1
 
-    sft_save_state = _default_sft_save_state()
+    sft_save_state = _initial_sft_save_state()
 
     sft_train(
         mock_components["policy"],
@@ -248,3 +330,38 @@ def test_training_with_negative_val_period(mock_components):
     )
 
     assert mock_components["policy"].train.call_count == 3
+
+
+def test_ft_save_period_triggers_periodic_saves(mock_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_components["master_config"]
+    cfg.sft.val_period = 0
+    cfg.sft.max_num_steps = 5
+    cfg.sft.max_num_epochs = 1
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    sft_save_state = _initial_sft_save_state()
+
+    with patch("nemo_rl.algorithms.sft.torch.save"):
+        sft_train(
+            mock_components["policy"],
+            mock_components["train_dataloader"],
+            None,
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            cfg,
+            mock_components["logger"],
+            checkpointer,
+            sft_save_state,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last
+    # step (5). Each save calls init_tmp_checkpoint(step, ...).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]

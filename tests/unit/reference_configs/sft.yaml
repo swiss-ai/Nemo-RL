@@ -41,6 +41,11 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     env_vars: {}
     cpu_offload: False
     sequence_parallel: false
@@ -71,6 +76,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   dynamic_batching:
     enabled: false
@@ -81,6 +87,7 @@ policy:
     enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
@@ -103,12 +110,20 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
-    use_linear_ce_fusion_loss: false
-    linear_ce_fusion_chunk_size: 256
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    cuda_graph_impl: "none"
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    fine_grained_activation_offloading: false
+    offload_modules: null
     recompute_granularity: "full"
     recompute_modules: null
     tensor_model_parallel_size: 1
@@ -130,11 +145,14 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -148,6 +166,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: None
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
 
     optimizer:
@@ -176,6 +195,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -200,6 +220,7 @@ policy:
       fp8_param: false
 
 data:
+  backend: hf
   max_input_seq_length: ${policy.max_total_sequence_length}
   add_bos: true
   add_eos: true
@@ -276,3 +297,8 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null

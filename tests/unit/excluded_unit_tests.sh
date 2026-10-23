@@ -2,7 +2,10 @@
 # Excluded unit tests for FAST CI mode (Lfast).
 # Source this file and append "${EXCLUDED_UNIT_TESTS[@]}" to pytest args.
 # Supports: --ignore=<path>, --ignore-glob=<pattern>, --deselect=<node_id>
-# All paths are relative to tests/ (run_unit.sh cwd).
+# --ignore/--ignore-glob paths are relative to tests/ (run_unit.sh cwd).
+# --deselect node IDs are relative to the pytest rootdir (the repo root), so
+# they start with "tests/". A node ID without that prefix matches nothing and
+# is ignored silently.
 #
 # Principles:
 #   - Run ALL cheap tests (<1s, pure math/mocks/tensor ops)
@@ -24,9 +27,6 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_multiple_tasks
     --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_missing_environment
     --deselect=tests/unit/algorithms/test_grpo.py::test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node
-    --deselect=tests/unit/algorithms/test_grpo.py::test_refit_policy_generation_sglang_colocated_http
-    --deselect=tests/unit/algorithms/test_grpo.py::test_refit_policy_generation_sglang_non_colocated_raises
-
     # test_utils.py — exclude only HF gated tokenizer tests
     --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_no_chat_template
     --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_default_chat_template
@@ -37,8 +37,10 @@ EXCLUDED_UNIT_TESTS=(
     # DISTRIBUTED
     ###########################################################################
 
-    # test_virtual_cluster.py — Ray cluster infrastructure tests (~58s each)
-    --ignore=unit/distributed/test_virtual_cluster.py
+    # test_virtual_cluster.py — exclude only the two tests over 1s; the rest are
+    # pure regex/set/mock checks (<1s), including the router-band guards.
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_mcore_py_executable
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_create_sorted_bundle_indices_for_unified_pg
 
     # test_worker_groups.py — exclude 2D sharding variants (require complex Ray setup)
     --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_single_data_2d_sharding_no_filter
@@ -78,11 +80,11 @@ EXCLUDED_UNIT_TESTS=(
 
     --ignore=unit/models/generation/test_vllm_large_model.py
 
-    # test_vllm_generation.py — keep 3 key expensive tests + 5 cheap replace_prefix_tokens tests
+    # test_vllm_generation.py — keep 3 key expensive tests + the replace_prefix_tokens integration test
     # Kept: test_vllm_policy_generation (basic generation correctness),
     #        test_vllm_weight_update_and_prefix_cache_reset (weight sync),
     #        test_vllm_generation_with_megatron_training (generation + megatron A+B),
-    #        test_VllmAsyncGenerationWorker_replace_prefix_tokens + 4 replace_prefix_tokens (cheap utility)
+    #        test_VllmAsyncGenerationWorker_replace_prefix_tokens (end-to-end splice with real tokenizer)
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_missing_required_config_key
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_top_p_top_k_validation
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_worker_seed_behavior
@@ -123,19 +125,6 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[False-False-bfloat16-True]
     --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[True-False-bfloat16-True]
 
-    # test_sglang_generation.py — keep 2 key tests
-    # Kept: test_sglang_policy_generation (basic generation correctness),
-    #        test_sglang_generation_with_hf_training_colocated (generation + HF training A+B)
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_missing_required_config_key
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_top_p_top_k_validation
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_worker_seed_behavior
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_policy_tensor_parallel
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_generate_text
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_http_server
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_non_divisible_batch_handling
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_generation_with_hf_training_non_colocated
-    --deselect=tests/unit/models/generation/test_sglang_generation.py::test_sglang_weight_update_and_prefix_cache_reset
-
     # test_vllm_utils.py — exclude only the @vllm-marked test (rest are cheap)
     --deselect=tests/unit/models/generation/test_vllm_utils.py::test_vllm_speculative_decoding_patch_still_needed
 
@@ -153,44 +142,23 @@ EXCLUDED_UNIT_TESTS=(
     --ignore=unit/models/policy/test_patches.py
 
     # test_dtensor_worker.py — keep 3 correctness checks, exclude rest (~52-116s each)
-    # Kept: test_dtensor_single_gpu_training[True], test_dtensor_loss_independent_of_microbatch_size_two_gpus,
-    #        test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded (v2 only, no llama)
+    # Kept: test_dtensor_single_gpu_training, test_dtensor_loss_independent_of_microbatch_size_two_gpus,
+    #        test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded (no llama)
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestSingleGPUCluster::test_dtensor_single_gpu_logprob
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_lm_policy_init
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training_with_lora
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_tp_and_tied_model_with_custom_parallel_plan
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_v1_policy_flops_range_check
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_policy_flops_range_check
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_with_lora
 
-    # DTensor — exclude v1 (use_v2=False) variants of kept tests
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestSingleGPUCluster::test_dtensor_single_gpu_training[False]
-
-    # DTensor logprob — exclude v1 variants (all 16 setups)
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup0]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup1]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup2]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup3]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup4]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup5]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup6]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup7]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup8]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup9]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup10]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup11]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup12]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup13]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup14]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup15]
-
-    # DTensor logprob — exclude llama variants (v2 only): setup2-4 = llama TP=2, setup11-13 = llama CP=2
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup2]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup3]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup4]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup11]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup12]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup13]
+    # DTensor logprob — exclude llama variants: setup2-4 = llama TP=2, setup11-13 = llama CP=2
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup2]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup3]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup4]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup11]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup12]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup13]
 
     # test_megatron_worker.py — keep 2 correctness checks (~190s total), exclude rest (~77-114s each)
     # Kept: test_megatron_loss_independent_of_microbatch_size (loss correctness),
@@ -218,14 +186,19 @@ EXCLUDED_UNIT_TESTS=(
     # Megatron — GPU-heavy data tests
     --ignore=unit/models/megatron/test_megatron_data.py
 
-    # DTensor — exclude parallelize_plan_keys (loads HF model configs, ~31-33s per param)
-    --deselect=tests/unit/models/dtensor/test_parallelize.py::test_parallelize_plan_keys
-
     ###########################################################################
-    # EXPERIENCE — rollout tests all require vLLM setup (~67-91s setup each)
+    # EXPERIENCE — rollout tests need vLLM setup (~67-91s each).
+    # Keep pure Python tests, plus the 3 matches_original tests that guard correctness.
     ###########################################################################
 
-    --ignore=unit/experience/test_rollouts.py
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_multi_step_calculator_vllm_sync
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_multi_step_calculator_vllm_async
+    --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_sync
+    --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_async
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_sliding_puzzle_vllm
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager_truncation
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_nemo_gym_rollout_manager
 
     ###########################################################################
     # ENVIRONMENTS

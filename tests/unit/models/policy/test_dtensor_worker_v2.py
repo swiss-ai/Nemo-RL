@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -31,15 +31,118 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 try:
+    import nemo_rl.models.policy.workers.dtensor_policy_worker_v2 as worker_mod
+    from nemo_rl.models.automodel.config import (
+        ModelAndOptimizerState,
+        RuntimeConfig,
+    )
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+        DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
         dtensor_params_generator,
-        get_train_context,
     )
 
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
+
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+        self.eval_called = False
+
+    def train(self):
+        self.train_called = True
+
+    def eval(self):
+        self.eval_called = True
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    DTensorPolicyWorkerV2Impl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("keep_train_buffers", [False, True])
+def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
+    monkeypatch, keep_train_buffers
+):
+    """``keep_train_buffers`` suppresses the optimizer offload and nothing else.
+
+    ``True`` is not reachable from a dtensor run today -- the split train API
+    that leaves a step open (begin_train_step / train_microbatch /
+    finish_train_step) exists only on the Megatron worker -- but the branch is
+    here, so pin it: inverted, it would strand the optimizer on CPU for the rest
+    of the step.
+    """
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    model = _FakeTrainableModel()
+    offloaded_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.offload_optimizer_for_logprob = True
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: offloaded_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
+
+    DTensorPolicyWorkerV2Impl.prepare_for_lp_inference(
+        worker, keep_train_buffers=keep_train_buffers
+    )
+
+    assert model.eval_called
+    assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = MagicMock()
+    worker.model.update_moe_gate_bias = MagicMock()
+
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+
+    worker.model.update_moe_gate_bias.assert_called_once_with()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    # A real module without the hook: getattr(..., None) must short-circuit so
+    # models that do not expose update_moe_gate_bias are unaffected.
+    worker.model = nn.Linear(1, 1)
+
+    # Should be a no-op and must not raise.
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
 
 
 def create_test_config(
@@ -50,12 +153,10 @@ def create_test_config(
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
-    dtensor_v2: bool = False,
     precision: str = "float32",
     expert_parallel_size: int = 1,
     sequence_packing_enabled: bool = False,
     automodel_kwargs: AutomodelKwargs | None = None,
-    checkpointing: dict | None = None,
 ) -> PolicyConfig:
     config = {
         "model_name": model_name,
@@ -84,8 +185,14 @@ def create_test_config(
             },
         },
         "dtensor_cfg": {
-            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
+            "_v2": True,
             "enabled": True,
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+                "single_rank_consolidation": False,
+                "consolidation_timeout_minutes": 30,
+            },
             "cpu_offload": cpu_offload,
             "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
@@ -125,8 +232,6 @@ def create_test_config(
     }
     if automodel_kwargs is not None:
         config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
-    if checkpointing is not None:
-        config["checkpointing"] = checkpointing
     return config
 
 
@@ -176,145 +281,6 @@ def two_gpu_virtual_cluster():
     cluster.shutdown()
 
 
-def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
-    """
-    Compare two model configurations and return a list of discrepancies.
-
-    Args:
-        config_v1: Model config from dtensor worker v1
-        config_v2: Model config from dtensor worker v2
-
-    Returns:
-        List of discrepancy descriptions. Empty list if configs are equivalent.
-    """
-    discrepancies = []
-
-    def compare_dicts(d1, d2, path=""):
-        """Recursively compare two dictionaries."""
-        all_keys = set(d1.keys()) | set(d2.keys())
-
-        for key in all_keys:
-            current_path = f"{path}.{key}" if path else key
-
-            if key not in d1:
-                discrepancies.append(f"Key '{current_path}' missing in v1 config")
-            elif key not in d2:
-                discrepancies.append(f"Key '{current_path}' missing in v2 config")
-            else:
-                val1, val2 = d1[key], d2[key]
-
-                if isinstance(val1, dict) and isinstance(val2, dict):
-                    compare_dicts(val1, val2, current_path)
-                elif val1 != val2:
-                    discrepancies.append(
-                        f"Value mismatch at '{current_path}': v1={val1}, v2={val2}"
-                    )
-
-    compare_dicts(config_v1, config_v2)
-    return discrepancies
-
-
-@pytest.mark.hf_gated
-@pytest.mark.automodel
-@pytest.mark.parametrize(
-    "model_fixture_name,tp,cp,sp,cpu_offload,activation_checkpointing",
-    [
-        # TP=2, CP=1
-        ("tiny_qwen2_model_path", 2, 1, False, False, False),
-        ("tiny_llama_model_path", 2, 1, False, False, False),
-        ("tiny_qwen3_model_path", 2, 1, False, False, False),
-        ("tiny_gemma3_model_path", 2, 1, False, False, False),
-        # TP=1, CP=2
-        ("tiny_qwen2_model_path", 1, 2, False, False, False),
-        ("tiny_llama_model_path", 1, 2, False, False, False),
-        ("tiny_qwen3_model_path", 1, 2, False, False, False),
-    ],
-)
-def test_dtensor_worker_v1_v2_model_config_equivalence(
-    request,
-    two_gpu_virtual_cluster,  # noqa: F811
-    model_fixture_name,
-    tp,
-    cp,
-    sp,
-    cpu_offload,
-    activation_checkpointing,
-):
-    """Test that dtensor worker v1 and v2 produce equivalent model configurations.
-
-    This test verifies that DTensorPolicyWorkerV2 produces the same model config
-    as the v1 worker, ensuring backward compatibility.
-    """
-    # Get the actual model path from the fixture name
-    model_name = request.getfixturevalue(model_fixture_name)
-    # Create v1 configuration
-    config_v1 = create_test_config(
-        model_name=model_name,
-        tp=tp,
-        cp=cp,
-        sp=sp,
-        cpu_offload=cpu_offload,
-        activation_checkpointing=activation_checkpointing,
-        dtensor_v2=False,  # Use v1 worker
-    )
-    # Create and test v1 policy first
-    print("Creating policy with v1 worker...")
-    policy_v1 = Policy(
-        tokenizer=get_tokenizer(config_v1["tokenizer"]),
-        config=config_v1,
-        init_optimizer=False,
-        init_reference_model=False,
-        cluster=two_gpu_virtual_cluster,
-        name_prefix="lm_policy_v1",
-    )
-
-    model_config_v1 = ray.get(
-        policy_v1.worker_group.workers[0].return_model_config.remote()
-    )
-    policy_v1.shutdown()
-
-    # Create v2 configuration
-    config_v2 = create_test_config(
-        model_name=model_name,
-        tp=tp,
-        cp=cp,
-        sp=sp,
-        cpu_offload=cpu_offload,
-        activation_checkpointing=activation_checkpointing,
-        dtensor_v2=True,  # Use v2 worker
-    )
-    policy_v2 = Policy(
-        tokenizer=get_tokenizer(config_v2["tokenizer"]),
-        config=config_v2,
-        init_optimizer=False,
-        init_reference_model=False,
-        cluster=two_gpu_virtual_cluster,
-        name_prefix="lm_policy_v2",
-    )
-
-    model_config_v2 = ray.get(
-        policy_v2.worker_group.workers[0].return_model_config.remote()
-    )
-    policy_v2.shutdown()
-
-    config_v1_dict = vars(model_config_v1)
-    config_v2_dict = vars(model_config_v2)
-    config_v1_dict.pop("nemo_version", None)
-    config_v2_dict.pop("nemo_version", None)
-    config_v1_dict.pop("pad_token_id", None)
-    config_v2_dict.pop("pad_token_id", None)
-
-    # if head_dim doesn't exist in raw HF model config, automodel (dtensor v2 worker) updates model config in-place
-    # so we need to remove the head_dim key from the v2 config
-    if "head_dim" not in config_v1_dict and "head_dim" in config_v2_dict:
-        config_v2_dict.pop("head_dim", None)
-
-    discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
-    assert not discrepancies, (
-        f"Model configurations differ between v1 and v2 approaches for {model_name}"
-    )
-
-
 @pytest.mark.hf_gated
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
@@ -340,8 +306,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
             model_name=tiny_llama_model_path,
             tp=2,
             cp=1,
-            dtensor_v2=True,
-            checkpointing=checkpointing_config,
         )
 
         policy = Policy(
@@ -363,8 +327,9 @@ def test_dtensor_v2_checkpoint_save_and_load(
             policy.save_checkpoint(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                checkpointing_cfg=checkpointing_config,
+                is_final_checkpoint=False,
             )
+            policy.finalize_async_save()
 
             # Verify checkpoint files were created
             assert os.path.exists(weights_path), "Weights path should exist after save"
@@ -374,8 +339,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 model_name=tiny_llama_model_path,
                 tp=2,
                 cp=1,
-                dtensor_v2=True,
-                checkpointing=checkpointing_config,
             )
 
             # Shutdown original policy first to free GPU memory
@@ -426,7 +389,6 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         model_name=tiny_llama_model_path,
         tp=2,
         cp=1,
-        dtensor_v2=True,
         precision=precision,
     )
 
@@ -630,6 +592,24 @@ class TestDTensorParamsGenerator:
                 f"Tensor {name} should be converted to {target_dtype}"
             )
 
+    def test_preserves_fp32_router_correction_bias(self):
+        """FP32 MoE router state must not be downcast during refit."""
+
+        class RouterModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer(
+                    "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "ordinary_buffer", torch.arange(4, dtype=torch.float32)
+                )
+
+        results = dict(dtensor_params_generator(RouterModel(), torch.bfloat16))
+
+        assert results["e_score_correction_bias"].dtype == torch.float32
+        assert results["ordinary_buffer"].dtype == torch.bfloat16
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange
@@ -724,183 +704,242 @@ class TestDTensorParamsGenerator:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-class TestGetTrainContext:
-    """Tests for the get_train_context context manager function."""
+def test_prepare_refit_info_preserves_fp32_router_correction_bias():
+    """Refit metadata must match the FP32 router-bias payload dtype."""
 
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
-    )
-    def test_no_cp_with_autocast(self, mock_create_cp_ctx, mock_get_train_ctx_am):
-        """Test context creation without context parallel but with autocast."""
-        # Arrange
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 1
-        cp_mesh = None
-        cp_buffers = []
-        sequence_dim = 1
-        dtype = torch.bfloat16
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
-
-        # Assert - CP context should not be created when cp_size=1
-        mock_create_cp_ctx.assert_not_called()
-        mock_get_train_ctx_am.assert_called_once_with(False, False, None)
-
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
-    )
-    def test_with_cp_and_autocast(self, mock_create_cp_ctx, mock_get_train_ctx_am):
-        """Test context creation with context parallel and autocast."""
-        # Arrange
-        mock_cp_ctx = MagicMock()
-        mock_create_cp_ctx.return_value = mock_cp_ctx
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 2
-        cp_mesh = MagicMock()
-        cp_buffers = [torch.randn(2, 10), torch.randn(2, 10)]
-        sequence_dim = 1
-        dtype = torch.bfloat16
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
-
-        # Assert - CP context should be created when cp_size > 1
-        mock_create_cp_ctx.assert_called_once_with(
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            cp_seq_dims=[sequence_dim] * len(cp_buffers),
-            cp_no_restore_buffers=set(cp_buffers),
-        )
-        mock_get_train_ctx_am.assert_called_once_with(False, False, mock_cp_ctx)
-
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
-    )
-    def test_autocast_disabled(self, mock_get_train_ctx_am):
-        """Test context creation with autocast disabled."""
-        # Arrange
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
-
-        cp_size = 1
-        cp_mesh = None
-        cp_buffers = []
-        sequence_dim = 1
-        dtype = torch.bfloat16
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=False,
-        ):
-            # Verify we're NOT in autocast mode
-            assert not torch.is_autocast_enabled("cuda"), (
-                "Autocast should be disabled when autocast_enabled=False"
+    class RouterModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "ordinary_buffer", torch.arange(4, dtype=torch.float32)
             )
 
-        # Assert
-        mock_get_train_ctx_am.assert_called_once_with(False, False, None)
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = RouterModel()
+    worker.dtype = torch.bfloat16
 
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+
+    assert refit_info["e_score_correction_bias"][1] == torch.float32
+    assert refit_info["ordinary_buffer"][1] == torch.bfloat16
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestAutocastContext:
+    """Tests for the precision context retained by the policy worker."""
+
+    def test_disabled_returns_noop_context(self):
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.autocast_enabled = False
+
+        with worker._autocast_context():
+            assert not torch.is_autocast_enabled("cuda")
+
+    @patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.torch.autocast")
+    def test_enabled_uses_worker_dtype(self, mock_autocast):
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.autocast_enabled = True
+        worker.dtype = torch.bfloat16
+        expected_context = MagicMock()
+        mock_autocast.return_value = expected_context
+
+        result = worker._autocast_context()
+
+        assert result is expected_context
+        mock_autocast.assert_called_once_with(device_type="cuda", dtype=torch.bfloat16)
+
+
+def _init_v2_worker_mocked(
+    monkeypatch,
+    *,
+    init_reference_model,
+    weights_path,
+    optimizer_path,
+    model_type=None,
+):
+    """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
+
+    Returns (worker, call_log, setup_mock, load_checkpoint_mock).
+    """
+    call_log = []
+
+    monkeypatch.setattr(worker_mod, "apply_transformer_engine_patch", lambda: None)
+    monkeypatch.setattr(worker_mod.ray, "get_gpu_ids", lambda: [0])
+    monkeypatch.setattr(
+        "nemo_rl.distributed.numa_utils.bind_to_gpu_numa", lambda gpu_id: None
     )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
+    monkeypatch.setattr(
+        "nemo_rl.models.automodel.setup.get_tokenizer",
+        lambda cfg, get_processor=False: MagicMock(name="tokenizer"),
     )
-    def test_cp_buffers_empty_when_cp_size_one(
-        self, mock_create_cp_ctx, mock_get_train_ctx_am
-    ):
-        """Test that CP context is not created when cp_size is 1."""
-        # Arrange
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
 
-        cp_size = 1
-        cp_mesh = MagicMock()
-        cp_buffers = []  # Empty buffers for cp_size=1
-        sequence_dim = 1
-        dtype = torch.float32
-
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
-
-        # Assert - CP context should not be created when cp_size=1
-        mock_create_cp_ctx.assert_not_called()
-
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.get_train_context_automodel"
+    # Unpacked as runtime config at the end of __init__.
+    runtime_config = RuntimeConfig(
+        model_class="model_class",
+        model_config=SimpleNamespace(model_type=model_type),
+        hf_config_overrides={},
+        allow_flash_attn_args=False,
+        attn_impl="attn_impl",
+        dtype=None,
+        enable_seq_packing=False,
+        max_grad_norm=1.0,
+        cpu_offload=False,
+        offload_optimizer_for_logprob=False,
+        is_generation_colocated=False,
+        sampling_params=None,
+        is_reward_model=False,
     )
-    @patch(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.create_context_parallel_ctx"
+    monkeypatch.setattr(
+        worker_mod, "validate_and_prepare_config", lambda **kw: runtime_config
     )
-    def test_multiple_cp_buffers_sequence_dim_replication(
-        self, mock_create_cp_ctx, mock_get_train_ctx_am
-    ):
-        """Test that sequence_dim is properly replicated for each CP buffer."""
-        # Arrange
-        mock_cp_ctx = MagicMock()
-        mock_create_cp_ctx.return_value = mock_cp_ctx
-        mock_get_train_ctx_am.return_value = lambda: contextlib.nullcontext()
+    monkeypatch.setattr(worker_mod, "setup_distributed", lambda **kw: MagicMock())
+    monkeypatch.setattr(worker_mod.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        worker_mod, "maybe_preinit_nixl_checkpoint_engine", lambda cfg: None
+    )
 
-        cp_size = 2
-        cp_mesh = MagicMock()
-        # Three buffers
-        cp_buffers = [torch.randn(2, 10), torch.randn(2, 10), torch.randn(2, 10)]
-        sequence_dim = 1
-        dtype = torch.float16
+    load_checkpoint_mock = MagicMock(
+        side_effect=lambda **kw: call_log.append("load_checkpoint")
+    )
 
-        # Act
-        with get_train_context(
-            cp_size=cp_size,
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            sequence_dim=sequence_dim,
-            dtype=dtype,
-            autocast_enabled=True,
-        ):
-            pass
+    def fake_init_checkpoint_manager(self, config_updates=None):
+        self._test_checkpoint_config_updates = config_updates
+        self.checkpoint_manager = MagicMock()
+        self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
 
-        # Assert - sequence_dim should be replicated for each buffer
-        mock_create_cp_ctx.assert_called_once()
-        call_kwargs = mock_create_cp_ctx.call_args[1]
-        assert call_kwargs["cp_seq_dims"] == [
-            sequence_dim,
-            sequence_dim,
-            sequence_dim,
-        ], "sequence_dim should be replicated for each buffer"
-        assert len(call_kwargs["cp_seq_dims"]) == 3
+    monkeypatch.setattr(
+        DTensorPolicyWorkerV2Impl,
+        "_init_checkpoint_manager",
+        fake_init_checkpoint_manager,
+    )
+
+    # Unpacked as model_and_optimizer_state.
+    model_and_optimizer_state = ModelAndOptimizerState(
+        model=MagicMock(name="model"),
+        optimizer=MagicMock(name="optimizer"),
+        scheduler=MagicMock(name="scheduler"),
+        is_hf_model=False,
+        is_moe_model=False,
+        is_reward_model=False,
+        model_class="model_class",
+        model_config="model_config",
+        peft_config=None,
+        autocast_enabled=False,
+    )
+    setup_mock = MagicMock(
+        side_effect=lambda **kw: (
+            call_log.append("setup_model_and_optimizer"),
+            model_and_optimizer_state,
+        )[1]
+    )
+    monkeypatch.setattr(worker_mod, "setup_model_and_optimizer", setup_mock)
+
+    ref_state = {"ref": "state"}
+    monkeypatch.setattr(
+        worker_mod,
+        "setup_reference_model_state",
+        lambda model: (call_log.append("setup_reference_model_state"), ref_state)[1],
+    )
+
+    config = {
+        "model_name": "base-model",
+        "tokenizer": {},
+        "dtensor_cfg": {
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+            },
+        },
+        "generation": {},
+    }
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    DTensorPolicyWorkerV2Impl.__init__(
+        worker,
+        config,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        init_reference_model=init_reference_model,
+    )
+    return worker, call_log, setup_mock, load_checkpoint_mock
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("model_type", "expected_async"),
+    [("deepseek_v4", False), ("deepseek_v3", True)],
+)
+def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
+    monkeypatch, model_type, expected_async
+):
+    worker, *_ = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=False,
+        weights_path=None,
+        optimizer_path=None,
+        model_type=model_type,
+    )
+
+    assert worker._test_checkpoint_config_updates["is_async"] is expected_async
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
+    """On resume with a KL reference, the reference must be captured from base
+    weights (checkpoint load deferred until after the capture)."""
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=True,
+        weights_path="/ckpt/weights",
+        optimizer_path="/ckpt/optim",
+    )
+    # (a) base weights used for setup: checkpoint paths not passed through.
+    assert setup_mock.call_args.kwargs["weights_path"] is None
+    assert setup_mock.call_args.kwargs["optimizer_path"] is None
+    # (b) reference captured BEFORE the checkpoint load.
+    assert call_log == [
+        "setup_model_and_optimizer",
+        "setup_reference_model_state",
+        "load_checkpoint",
+    ]
+    assert worker.reference_model_state_dict == {"ref": "state"}
+    # (c) checkpoint still loaded, with the original paths.
+    assert load_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
+    assert load_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
+    assert load_mock.call_args.kwargs["model"] is worker.model
+    assert load_mock.call_args.kwargs["optimizer"] is worker.optimizer
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_resume_without_reference_model_passes_paths_through(monkeypatch):
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=False,
+        weights_path="/ckpt/weights",
+        optimizer_path="/ckpt/optim",
+    )
+    assert setup_mock.call_args.kwargs["weights_path"] == "/ckpt/weights"
+    assert setup_mock.call_args.kwargs["optimizer_path"] == "/ckpt/optim"
+    load_mock.assert_not_called()
+    assert worker.reference_model_state_dict is None
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
+    worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=True,
+        weights_path=None,
+        optimizer_path=None,
+    )
+    assert setup_mock.call_args.kwargs["weights_path"] is None
+    load_mock.assert_not_called()
+    assert worker.reference_model_state_dict == {"ref": "state"}

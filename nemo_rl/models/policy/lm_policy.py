@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import numpy as np
 import ray
@@ -31,14 +31,17 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -46,16 +49,46 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
-from nemo_rl.models.policy.utils import resolve_policy_worker_cls
-from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.models.policy.utils import (
+    aggregate_per_sample_handles,
+    reject_dtensor_v1,
+    resolve_policy_worker_cls,
+    validate_fp32_lm_head_config,
+)
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
-    get_default_hf_config,
+    get_hf_config,
     get_theoretical_tflops,
+)
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_sharded_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+def _aggregate_megatron_flops_metrics(
+    results: list[dict],
+    world_size: int,
+) -> dict:
+    """Aggregate FLOPS metrics from Megatron worker results.
+
+    Called when the Megatron worker returns total_flops directly (no FLOPTracker).
+    """
+    aggregated: dict = {}
+    aggregated["total_flops"] = results[0]["total_flops"]
+    aggregated["num_ranks"] = results[0].get("num_ranks", world_size)
+    if "train_elapsed_seconds" in results[0]:
+        aggregated["train_elapsed_seconds"] = results[0]["train_elapsed_seconds"]
+    try:
+        aggregated["theoretical_tflops"] = aggregated[
+            "num_ranks"
+        ] * get_theoretical_tflops(results[0]["gpu_name"], results[0]["model_dtype"])
+    except Exception as e:
+        warnings.warn(f"Error getting theoretical flops: {e}")
+    return aggregated
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
@@ -72,7 +105,40 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
+        skip_weight_load: bool = False,
+        is_refit_destination: bool = False,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
     ):
+        self.debug_payload_metrics = False
+        configured_extension_fqn = config.get("worker_extension_cls_fqn")
+        if (
+            configured_extension_fqn is not None
+            and worker_extension_cls_fqn is not None
+            and configured_extension_fqn != worker_extension_cls_fqn
+        ):
+            raise ValueError(
+                "worker_extension_cls_fqn was set to different values in the "
+                "policy config and Policy constructor"
+            )
+        extension_fqn = (
+            configured_extension_fqn
+            if configured_extension_fqn is not None
+            else worker_extension_cls_fqn
+        )
+        # Only the config-supplied FQN is mutually exclusive with quant_cfg: a config
+        # author cannot know which worker quant_cfg resolves to, so silently replacing
+        # it would be a footgun. The constructor argument is exempt because callers
+        # passing it already see the resolved class name and are expected to subclass
+        # it, which has always been supported alongside quantization.
+        if configured_extension_fqn is not None and config.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom policy worker cannot be combined with ModelOpt quantization"
+            )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
+
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -82,27 +148,96 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tp_size = 1
         pp_size = 1
         cp_size = 1
-        use_v2 = False
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        # Normalize in place: every downstream reader (workers, setup, train)
+        # accesses draft config by attribute, so a hand-built PolicyConfig has
+        # to be validated here rather than only inside MasterConfig.
+        draft_config = coerce_draft_config(config.get("draft"))
+        if draft_config is not None:
+            config["draft"] = draft_config
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
+        generation_config = config.get("generation") or {}
+        nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires the Megatron "
+                "training backend (policy.megatron_cfg.enabled=true); DTensor "
+                "does not implement TE NVFP4 training."
+            )
+        validate_fp32_lm_head_config(
+            config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
+        )
+        hf_config = None
+        hf_config_overrides = config.get("hf_config_overrides") or {}
+        generation_config = config.get("generation")
+        if generation_config is not None and generation_config["backend"] == "vllm":
+            vllm_cfg = generation_config.get("vllm_cfg")
+            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
+                validate_fp32_lm_head_config(
+                    config,
+                    megatron_enabled=megatron_enable,
+                    dtensor_enabled=dtensor_enable,
+                    model_config=hf_config,
+                )
+        if reserved_http_server_ports is not None and not megatron_enable:
+            raise ValueError(
+                "reserved_http_server_ports is only supported by the Megatron "
+                "worker (policy.megatron_cfg.enabled=true)."
             )
         if draft_enabled and not megatron_enable:
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
             )
-        if draft_enabled and bool(
-            config.get("sequence_packing", {}).get("enabled", False)
-        ):
+        if draft_enabled and config["megatron_cfg"]["context_parallel_size"] > 1:
+            # Sequence packing itself is supported with the draft; CP is not:
+            # the hidden-state capture and the per-segment shifts assume each
+            # packed sequence lives whole on one rank.
             raise ValueError(
-                "policy.draft.enabled=true does not support sequence packing yet. "
-                "Disable policy.sequence_packing.enabled or policy.draft."
+                "policy.draft.enabled=true does not support context parallelism "
+                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
+                "policy.draft."
+            )
+        if (
+            draft_enabled
+            # sequence_packing is NotRequired in PolicyConfig, so tolerate its
+            # absence; the parallel sizes are required megatron_cfg keys.
+            and bool(config.get("sequence_packing", {}).get("enabled", False))
+            and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        ):
+            # The packed draft path re-embeds the per-segment-shifted token ids
+            # via the model's embedding, which MCore constructs only on the
+            # first pipeline stage while the draft runs on the last.
+            raise ValueError(
+                "policy.draft.enabled=true with sequence packing does not "
+                "support pipeline parallelism yet. Set "
+                "policy.megatron_cfg.pipeline_model_parallel_size=1, or disable "
+                "policy.sequence_packing or policy.draft."
+            )
+        if draft_enabled and bool(
+            # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+            config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+        ):
+            # The fused path returns per-token logprobs and never materializes
+            # the full next-token logits the draft's teacher distribution
+            # needs, in either the packed or the unpacked layout.
+            raise ValueError(
+                "policy.draft.enabled=true is not supported with "
+                "policy.megatron_cfg.use_fused_linear_logprobs=true: draft "
+                "training needs the full next-token logits for the teacher, "
+                "which the fused path never materializes. Disable one of the "
+                "two."
             )
         if megatron_enable:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
@@ -113,7 +248,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
-            env_vars = config["megatron_cfg"].get("env_vars", {})
+            env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
@@ -128,32 +263,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
                 )
 
-            # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
-            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
-            if use_v2:
-                worker_builder_cls_fqn = resolve_policy_worker_cls(
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
-                    config,
-                )
-                if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-                    warnings.warn(
-                        "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
-                        "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
-                    )
-            else:
-                assert (
-                    config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
-                    is False
-                ), "LoRA is not supported for DTensorPolicyWorker V1"
-                if config["dtensor_cfg"].get("dp_replicate_size", 1) > 1:
-                    raise ValueError(
-                        "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
-                        "(Automodel DTensor v2 backend). HSDP is not supported with the "
-                        "V1 DTensor worker."
-                    )
-                worker_builder_cls_fqn = resolve_policy_worker_cls(
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
-                    config,
+            reject_dtensor_v1(config["dtensor_cfg"], "policy.dtensor_cfg")
+            worker_builder_cls_fqn = resolve_policy_worker_cls(
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                config,
+            )
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                warnings.warn(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
@@ -162,11 +280,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
-        if worker_extension_cls_fqn is not None:
+        if extension_fqn is not None:
             print(
-                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+                f"Using worker extension class: {extension_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
             )
-            worker_builder_cls_fqn = worker_extension_cls_fqn
+            worker_builder_cls_fqn = extension_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -233,9 +351,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
+        if megatron_enable:
+            worker_kwargs["is_refit_destination"] = is_refit_destination
+        elif is_refit_destination:
+            raise ValueError("is_refit_destination=True requires the Megatron backend.")
+        if skip_weight_load:
+            worker_kwargs["skip_weight_load"] = True
+        if reserved_http_server_ports is not None:
+            worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
-        if use_v2:
-            # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
+        if dtensor_enable:
+            # DTensor workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
         else:
@@ -297,8 +423,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # initialize FLOPs tracker
         try:
+            if hf_config is None:
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
             self.flops_tracker = FLOPTracker.from_config(
-                config["model_name"], get_default_hf_config(config["model_name"])
+                config["model_name"],
+                hf_config,
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -313,6 +445,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
+            microbatch_order = config["sequence_packing"].get("microbatch_order")
+            if microbatch_order is not None:
+                self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if pair_grouping_key := config["sequence_packing"].get("pair_grouping_key"):
+                self.sequence_packing_args["pair_grouping_key"] = pair_grouping_key
+            if (
+                max_sequences_per_bin := config["sequence_packing"].get(
+                    "max_sequences_per_bin"
+                )
+            ) is not None:
+                self.sequence_packing_args["max_sequences_per_bin"] = (
+                    max_sequences_per_bin
+                )
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
@@ -320,6 +465,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+
+    @property
+    def data_parallel_size(self) -> int:
+        """Data-parallel degree, read from the policy's sharding annotations."""
+        return self.sharding_annotations.get_axis_size("data_parallel")
 
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
@@ -360,7 +510,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        rank_offset: int = 0,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -369,9 +526,45 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             port=port,
             world_size=world_size,
             train_world_size=train_world_size,
+            rank_offset=rank_offset,
+            nccl_peer=nccl_peer,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_execution_batch_bytes: int | None,
+        refit_backend: str,
+    ) -> list[ray.ObjectRef]:
+        """Initialize the megatron refit collective on this policy's workers."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
+            refit_backend=refit_backend,
+        )
+
+    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVSHMEM on this policy's workers (no-op when not using nvshmem)."""
+        return self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+
+    def swap_weights_via_reshard(self, *, is_source: bool) -> list[ray.ObjectRef]:
+        """Send (`is_source=True`) or receive (`is_source=False`) weights via megatron reshard."""
+        return self.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=is_source,
+        )
 
     # ── DP-shard helpers ────────────────────────────────────────────────
     # DRY for Policy's logprob/train methods only. The data-plane sibling
@@ -388,7 +581,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         is the inverse permutation needed to undo seqpack/dynbatch reorder
         (``None`` when neither is enabled).
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -429,7 +622,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -455,6 +648,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         return sharded_data
 
+    def _report_sharded_payload(
+        self,
+        sharded_data: list["SlicedDataDict"],
+        boundary: str,
+    ) -> None:
+        """Measure the exact unique per-DP-shard Ray arguments."""
+        if not self.debug_payload_metrics:
+            return
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                boundary,
+                enabled=True,
+            )
+        )
+
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -469,6 +678,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+        self._report_sharded_payload(sharded_data, "policy_get_logprobs")
 
         with (
             timer.time("get_logprobs/submit_logprob_futures")
@@ -517,6 +727,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             else nullcontext()
         ):
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+        self._report_sharded_payload(sharded_data, "policy_get_reference_logprobs")
 
         with (
             timer.time(
@@ -601,6 +812,64 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def get_full_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> list[dict[str, Any]]:
+        """Ship the teacher's full-vocab logits to the student via CUDA IPC.
+
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Gathers each worker's ``{"dp_rank", "per_sample_handles"}`` and
+        returns the global-batch-ordered list produced by
+        :func:`aggregate_per_sample_handles`: a length-``gbs`` list where
+        element ``i`` is ``{"teacher_shards": [shard, ...]}`` holding every
+        TP×CP shard of global sample ``i``. Each shard carries the IPC payload
+        plus the ``buf_idx`` / ``sample_index_in_buf`` slot index and the TP/CP
+        shard metadata; the loss consumer reassembles the full ``[T_t, V_t]``
+        teacher logits (or its CP-local window) from these shards.
+
+        The producer-side IPC storage is persistent and reused across calls
+        (via ``copy_``); the caller releases it once via
+        :meth:`release_ipc_buffer` at the end of training / validation (and on
+        error), not per call.
+
+        v0 limitation: no dynamic batching, no sequence packing.
+        """
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_full_logits_ipc does not support dynamic batching "
+                "or sequence packing in v0."
+            )
+        dp_size = self.data_parallel_size
+        with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+        with timer.time("get_full_logits_ipc/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_full_logits_ipc",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                # Keep every TP × CP output; consumer routes via overlap.
+                output_is_replicated=["pipeline_parallel"],
+                common_kwargs={"micro_batch_size": micro_batch_size},
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        return aggregate_per_sample_handles(worker_results)
+
+    def release_ipc_buffer(self) -> None:
+        """Tell all workers to drop their stashed IPC tensors."""
+        futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
+        ray.get(futures)
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -609,13 +878,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
+        """Train the policy on a batch of data with a given loss function.
+
+        Args:
+            check_dim_skip_keys: Keys whose tensors are not student-sequence-aligned at
+                dim 1 and must be excluded from the worker's sequence-dim
+                pre-flight check. Used by cross-tokenizer distillation to
+                pass through teacher / alignment auxiliaries that ride on
+                the same data dict.
+        """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
             sharded_data = self._shard_for_train(data, batch_size)
+        self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
@@ -648,6 +927,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    "check_dim_skip_keys": check_dim_skip_keys,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -659,6 +939,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+        if "mtp_metrics" in results[0]:
+            aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
+        if "draft_grad_norm" in results[0]:
+            aggregated_results["draft_grad_norm"] = results[0]["draft_grad_norm"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -672,6 +956,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             except Exception as e:
                 warnings.warn(f"Error getting theoretical flops: {e}")
+        elif results and "total_flops" in results[0]:
+            aggregated_results.update(
+                _aggregate_megatron_flops_metrics(
+                    results, self.worker_group.cluster.world_size()
+                )
+            )
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
@@ -686,15 +976,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
-        # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
         assert "input_ids" in data and "input_lengths" in data, (
             "Missing required input fields"
         )
+        assert self.cfg["generation"] is not None, "Generation config is not set"
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
@@ -704,13 +994,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             output_is_replicated=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"greedy": greedy},
         )
-        assert self.cfg["generation"] is not None, "Generation config is not set"
-        result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
+        result = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures),
             pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
         )
 
-        # Verify the output has all required fields
         required_keys = [
             "output_ids",
             "generation_lengths",
@@ -737,7 +1025,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "score",
@@ -774,35 +1062,54 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
-    def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put every worker in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA.
+                Set this when a train step is already open, so that gradients
+                accumulated by earlier streaming chunks survive; see
+                ``MegatronPolicyWorker.prepare_for_lp_inference``.
+        """
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_for_lp_inference"
+            "prepare_for_lp_inference", keep_train_buffers=keep_train_buffers
         )
         ray.get(futures)
-
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        # We don't need to do anything here
-        return True
 
     def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
         # We don't need to do anything here
         return True
 
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
         Returns:
             dict: A dictionary containing the info for refit.
         """
-        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_refit_info", refit_payload_mode=refit_payload_mode
+        )
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
         return results[0]
+
+    def finish_inference(self) -> None:
+        """Offload policy model to CPU after inference."""
+        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+        ray.get(futures)
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
@@ -822,7 +1129,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         distributed reduction, returning results merged across ranks. Therefore, we shard the
         input by DP and call in parallel, then take the result from the first worker.
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -846,6 +1153,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=None,
             )
+        self._report_sharded_payload(sharded_data, "policy_kv_calibration")
 
         futures = self.worker_group.run_all_workers_sharded_data(
             "calibrate_qkv_fp8_scales",
@@ -889,30 +1197,159 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         return futures
 
-    def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
-    ) -> list[ray.ObjectRef]:
-        """Send the weights to SGLang servers via HTTP API.
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
 
-        Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+        Called by the SGLang colocated refit drivers (Megatron and FSDP)
+        whenever engines are added or recovered.
         """
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_http",
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            "connect_sglang_rollout_engines",
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Send Megatron-restored HF tensors to colocated SGLang via Ray IPC."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_colocated",
+            rollout_engines=rollout_engines,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines_distributed",
+            rollout_engines=rollout_engines,
+            engine_gpu_counts=engine_gpu_counts,
+            group_name=group_name,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Broadcast Megatron-restored HF tensors to SGLang via NCCL (rank 0 only)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_distributed",
+            rollout_engines=rollout_engines,
+            rollout_engine_lock=rollout_engine_lock,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
         )
         return futures
 
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    def init_nccl_reshard_comm_group(
+        self,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        pp_stages: list[int],
+        sub_world_size: int,
+        ranks_in_group: list[int],
+    ) -> list[ray.ObjectRef]:
+        """Initialize the nccl_reshard bulk-path comm group on all train workers."""
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "init_nccl_reshard_comm_group",
+            my_pp_stage=pp_stages,
+            my_rank_in_group=ranks_in_group,
+            common_kwargs={
+                "pp_ips": pp_ips,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        # co-works with vllm; wait for all futures to complete outside
+        return futures
+
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, Any],
+        gen_parallelism: dict[str, Any],
+        train_world_size: int,
+        gen_world_size: int,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> dict[str, Any]:
+        """Prepare per-layer param metadata for nccl_reshard refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_nccl_reshard_refit_info",
+            train_parallelism=train_parallelism,
+            gen_parallelism=gen_parallelism,
+            train_world_size=train_world_size,
+            gen_world_size=gen_world_size,
+            refit_payload_mode=refit_payload_mode,
+        )
+        results = ray.get(futures)
+        return results[0]
+
+    def nccl_reshard_refit(
+        self, kv_scales=None, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "nccl_reshard_refit",
+            kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
+        )
+        return futures
+
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest parameters on every policy worker before refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "sync_params_before_refit"
+        )
+        ray.get(futures)
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
@@ -924,33 +1361,35 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
         ray.get(futures)
 
+    def offload_to_cpu(self) -> None:
+        """Offload to CPU to free GPU memory; currently only used by PPO."""
+        self.offload_after_refit()
+
     def save_checkpoint(
         self,
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
-        """Save a checkpoint of the model."""
-        # Only pass checkpointing_cfg for DTensor v2
-        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+        """Save a checkpoint of the model.
 
-        if use_v2:
+        With Megatron async_save=True, this returns after D2H staging. The caller
+        must call finalize_async_save() before renaming the checkpoint directory.
+
+        DTensor checkpoint resources are configured when the Policy is
+        constructed. ``weights_path`` selects the destination for each save.
+        """
+        if bool(self.cfg.get("dtensor_cfg", {}).get("enabled", False)):
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
+                is_final_checkpoint=is_final_checkpoint,
             )
         else:
-            if (
-                checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format", None) is not None
-            ):
-                raise ValueError(
-                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
-                )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
@@ -959,11 +1398,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         ray.get(futures)
 
+    def finalize_async_save(self) -> None:
+        """Block until all workers' in-flight async checkpoint writes complete.
+
+        No-op when async_save is disabled. Must be called before the checkpoint
+        directory is renamed from tmp_step_N/ to step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
+        ray.get(futures)
+
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
+        if not hasattr(self, "worker_group"):
+            return True
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
+        except ray.exceptions.RayActorError:
+            # Workers already dead (e.g., shut down via another handle to the same actors).
+            return True
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
@@ -971,12 +1424,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
-        This is an extra safety net in case the user forgets to call worker_group.shutdown() and the pointer to
+        This is an extra safety net in case the user forgets to call shutdown() and the pointer to
         the object is lost due to leaving a function scope. It's always recommended that the
-        user calls worker_group.shutdown().
+        user calls shutdown().
         """
-        if hasattr(self, "worker_group"):
-            self.worker_group.shutdown(cleanup_method="shutdown")
+        self.shutdown()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

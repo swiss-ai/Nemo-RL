@@ -1,0 +1,59 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Iterable
+
+TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
+    {
+        "Gemma3ForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
+        "Mistral3ForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
+
+def find_tokenizer_required_architectures(
+    architectures: Iterable[str] | None,
+) -> list[str]:
+    """Return architectures for which vLLM must initialize a tokenizer."""
+    return [
+        architecture
+        for architecture in architectures or ()
+        if architecture in TOKENIZER_REQUIRED_ARCHITECTURES
+    ]
+
+
+def resolve_distributed_executor_backend(
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    expert_parallel_size: int,
+) -> str | None:
+    if tensor_parallel_size * pipeline_parallel_size > 1:
+        return "ray"
+    if expert_parallel_size > tensor_parallel_size:
+        # External DP actors already own one GPU each.
+        return "uni"
+    return None
+
+
+def resolve_data_parallel_local_rank(
+    rank: int, model_parallel_size: int, executor_backend: str | None
+) -> int:
+    # Ray remaps one GPU into each external-DP actor.
+    if executor_backend == "uni":
+        return 0
+    return (rank % 8) // model_parallel_size

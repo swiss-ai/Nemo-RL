@@ -24,6 +24,7 @@ focusing on:
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -120,6 +121,156 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["packed_seq_params"] == mock_packed_seq_params
 
+    def test_model_forward_drops_prepacked_boundary_transport_fields(self):
+        """Packed boundary containers must not become VLM forward kwargs."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 3, 100))
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {
+            "cu_seqlens": torch.tensor([0, 3], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+            "pixel_values": torch.randn(1, 3, 2, 2),
+        }
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            position_ids=None,
+            attention_mask=None,
+            packed_seq_params=MagicMock(),
+        )
+
+        call_kwargs = mock_model.call_args.kwargs
+        assert "cu_seqlens" not in call_kwargs
+        assert "cu_seqlens_padded" not in call_kwargs
+        assert "pixel_values" in call_kwargs
+
+    def test_model_forward_passes_padding_mask(self):
+        """Packed fake-token positions are forwarded to the MCore MoE router."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 4, 100))
+        mock_model.config = SimpleNamespace(sequence_parallel=False)
+        mock_model.pre_process = True
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {}
+        padding_mask = torch.tensor([[False, False, True, True]])
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 0, 0]]),
+            position_ids=None,
+            attention_mask=None,
+            packed_seq_params=MagicMock(),
+            padding_mask=padding_mask,
+        )
+
+        assert torch.equal(mock_model.call_args.kwargs["padding_mask"], padding_mask)
+
+    def test_hybrid_model_padding_mask_is_sequence_parallel_sharded(self):
+        """HybridModel does not shard its MoE padding mask internally."""
+        from nemo_rl.models.megatron.train import _prepare_padding_mask_for_model
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(sequence_parallel=True),
+            pre_process=True,
+        )
+        padding_mask = torch.tensor([[False, True, False, True]])
+        scattered = torch.tensor([[False], [False]])
+        tp_group = MagicMock()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.train.tensor_parallel.scatter_to_sequence_parallel_region",
+                return_value=scattered,
+            ) as mock_scatter,
+            patch(
+                "nemo_rl.models.megatron.train.get_tensor_model_parallel_group",
+                return_value=tp_group,
+            ),
+        ):
+            result = _prepare_padding_mask_for_model(model, padding_mask)
+
+        mock_scatter.assert_called_once()
+        assert torch.equal(mock_scatter.call_args.args[0], padding_mask.transpose(0, 1))
+        assert mock_scatter.call_args.kwargs["group"] is tp_group
+        assert torch.equal(result, scattered.transpose(0, 1))
+
+    def test_model_owned_cp_keeps_full_padding_mask(self):
+        """A model that slices CP inputs must receive its full THD padding mask."""
+        from nemo_rl.models.megatron.train import _prepare_padding_mask_for_model
+
+        model = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True))
+        padding_mask = torch.tensor([[False, True, False, True]])
+
+        with patch(
+            "nemo_rl.models.megatron.train.tensor_parallel.scatter_to_sequence_parallel_region"
+        ) as mock_scatter:
+            result = _prepare_padding_mask_for_model(
+                model,
+                padding_mask,
+                model_slices_context_parallel_inputs=True,
+            )
+
+        mock_scatter.assert_not_called()
+        assert result is padding_mask
+
+    def test_non_first_gpt_stage_padding_mask_is_sequence_parallel_sharded(self):
+        """GPTModel only shards the mask itself on its embedding stage."""
+        from nemo_rl.models.megatron import train
+
+        class FakeGPTModel:
+            def __init__(self):
+                self.config = SimpleNamespace(sequence_parallel=True)
+                self.pre_process = False
+
+        model = FakeGPTModel()
+        padding_mask = torch.tensor([[False, True, False, True]])
+        scattered = torch.tensor([[False], [False]])
+
+        with (
+            patch.object(train, "GPTModel", FakeGPTModel),
+            patch.object(
+                train.tensor_parallel,
+                "scatter_to_sequence_parallel_region",
+                return_value=scattered,
+            ) as mock_scatter,
+            patch.object(
+                train, "get_tensor_model_parallel_group", return_value=MagicMock()
+            ),
+        ):
+            result = train._prepare_padding_mask_for_model(model, padding_mask)
+
+        mock_scatter.assert_called_once()
+        assert torch.equal(result, scattered.transpose(0, 1))
+
+    def test_first_gpt_stage_keeps_mask_for_mcore_to_shard(self):
+        """Avoid double-sharding the mask handled by GPTModel._preprocess."""
+        from nemo_rl.models.megatron import train
+
+        class FakeGPTModel:
+            def __init__(self):
+                self.config = SimpleNamespace(sequence_parallel=True)
+                self.pre_process = True
+
+        model = FakeGPTModel()
+        padding_mask = torch.tensor([[False, True, False, True]])
+
+        with (
+            patch.object(train, "GPTModel", FakeGPTModel),
+            patch.object(
+                train.tensor_parallel,
+                "scatter_to_sequence_parallel_region",
+            ) as mock_scatter,
+        ):
+            result = train._prepare_padding_mask_for_model(model, padding_mask)
+
+        mock_scatter.assert_not_called()
+        assert result is padding_mask
+
     def test_model_forward_with_defer_fp32_logits(self):
         """Test model_forward passes fp32_output when defer_fp32_logits is True."""
         from nemo_rl.models.megatron.train import model_forward
@@ -142,8 +293,18 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["fp32_output"] is False
 
-    def test_model_forward_clears_position_ids_for_multimodal(self):
-        """Test model_forward sets position_ids to None for multimodal data."""
+    @pytest.mark.parametrize(
+        ("model_slices_context_parallel_inputs", "keeps_position_ids"),
+        [
+            pytest.param(False, False, id="vlm-derives-own-positions"),
+            pytest.param(True, True, id="caller-packed-model-keeps-positions"),
+        ],
+    )
+    def test_model_forward_position_ids_for_multimodal(
+        self, model_slices_context_parallel_inputs, keeps_position_ids
+    ):
+        """Multimodal batches drop caller position_ids unless the model consumes
+        caller-packed inputs (Nemotron Omni), whose MTP block needs them."""
         from nemo_rl.models.megatron.train import model_forward
 
         mock_model = MagicMock()
@@ -153,17 +314,22 @@ class TestModelForward:
         mock_data_dict.get_multimodal_dict.return_value = {
             "images": torch.randn(1, 3, 224, 224)
         }
+        position_ids = torch.tensor([[0, 1, 2]])
 
         model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
-            position_ids=torch.tensor([[0, 1, 2]]),
+            position_ids=position_ids,
             attention_mask=torch.ones(1, 3),
+            model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         )
 
         call_kwargs = mock_model.call_args[1]
-        assert call_kwargs["position_ids"] is None
+        if keeps_position_ids:
+            assert call_kwargs["position_ids"] is position_ids
+        else:
+            assert call_kwargs["position_ids"] is None
 
 
 class TestApplyTemperatureScaling:
@@ -284,6 +450,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         data_iterator = iter([processed_mb])
@@ -295,9 +462,13 @@ class TestForwardWithPostProcessingFn:
                 data_iterator=data_iterator,
                 model=MagicMock(),
                 post_processing_fn=post_processor,
+                model_slices_context_parallel_inputs=True,
             )
 
         mock_model_forward.assert_called_once()
+        forward_kwargs = mock_model_forward.call_args.kwargs
+        assert forward_kwargs["model_slices_context_parallel_inputs"] is True
+        assert forward_kwargs["position_ids"] is processed_mb.position_ids
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
@@ -318,6 +489,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         data_iterator = iter([processed_mb])
@@ -420,6 +592,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         cfg = {
@@ -464,6 +637,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
 
         cfg = {
@@ -615,6 +789,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": False}}
@@ -677,6 +852,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            original_seq_length=3,
         )
         post_processor = LogprobsPostProcessor(
             cfg={"sequence_packing": {"enabled": False}}
@@ -701,6 +877,86 @@ class TestForwardWithPostProcessingFn:
             hidden_states=hidden_states,
             input_embeds=shifted_embeds,
             attention_mask=attention_mask,
+            packed_seq_params=None,
+        )
+        assert data_dict["student_logits"] is student_logits
+
+    @patch("nemo_rl.models.megatron.train._pack_input_ids")
+    @patch("nemo_rl.models.megatron.train.get_capture_context")
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_with_draft_model_packed_shifts_ids_and_reembeds(
+        self,
+        mock_model_forward,
+        mock_get_capture_context,
+        mock_pack_input_ids,
+    ):
+        """Packed draft forward must shift ids per segment, re-embed, and pass packed_seq_params."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        output_tensor = torch.randn(1, 6, 5)
+        student_logits = torch.randn(1, 6, 5)
+        hidden_states = torch.randn(6, 1, 4)
+        shifted_input_ids = torch.tensor([[2, 3, 0, 5, 6, 0]])
+        shifted_embeds = torch.randn(6, 1, 4)
+        position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
+        packed_seq_params = SimpleNamespace(
+            cu_seqlens_q=torch.tensor([0, 3, 6]),
+            cu_seqlens_q_padded=torch.tensor([0, 3, 6]),
+        )
+
+        mock_model_forward.return_value = output_tensor
+        mock_pack_input_ids.return_value = shifted_input_ids
+        mock_capture = MagicMock()
+        mock_capture.get_captured_states.return_value = SimpleNamespace(
+            hidden_states=hidden_states,
+            inputs_embeds=None,
+        )
+        mock_capture.model.embedding.return_value = shifted_embeds
+        mock_get_capture_context.return_value = (nullcontext(), mock_capture)
+
+        data_dict = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]])}
+        attention_mask = torch.ones(1, 6)
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+            original_seq_length=3,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}}
+        )
+        draft_model = MagicMock(return_value=student_logits)
+
+        with patch.object(post_processor, "__call__", return_value=MagicMock()):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                draft_model=draft_model,
+            )
+
+        mock_pack_input_ids.assert_called_once_with(
+            data_dict["input_ids"],
+            packed_seq_params.cu_seqlens_q,
+            packed_seq_params.cu_seqlens_q_padded,
+            roll_shift=-1,
+        )
+        mock_capture.model.embedding.assert_called_once_with(
+            input_ids=shifted_input_ids, position_ids=position_ids
+        )
+        draft_model.assert_called_once_with(
+            hidden_states=hidden_states,
+            input_embeds=shifted_embeds,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
         )
         assert data_dict["student_logits"] is student_logits
 
@@ -764,10 +1020,315 @@ class TestMegatronForwardBackward:
             mbs=1,
             post_processing_fn=post_processor,
             forward_only=True,
+            model_slices_context_parallel_inputs=True,
         )
 
         call_kwargs = mock_fb_func.call_args[1]
         assert call_kwargs["forward_only"] is True
+        forward_step_func = call_kwargs["forward_step_func"]
+        assert (
+            forward_step_func.keywords["model_slices_context_parallel_inputs"] is True
+        )
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_preserves_activation_offload_warmup(
+        self, mock_get_fb: MagicMock
+    ) -> None:
+        """Forward-only RL stages must not consume activation-offload warmup."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+        empty_manager = SimpleNamespace(
+            _is_warmup=True,
+            _cached_chunks_forward=[],
+        )
+
+        def run_forward_only(**kwargs: Any) -> dict[str, torch.Tensor]:
+            assert kwargs["forward_only"] is True
+            assert model_config.fine_grained_activation_offloading is False
+            PipelineOffloadManager.OFFLOAD_MGR = empty_manager
+            return {"logprobs": torch.tensor(0.0)}
+
+        mock_get_fb.return_value = run_forward_only
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", None):
+            megatron_forward_backward(
+                model=model,
+                data_iterator=iter([]),
+                num_microbatches=1,
+                seq_length=64,
+                mbs=1,
+                post_processing_fn=post_processor,
+                forward_only=True,
+            )
+
+            assert PipelineOffloadManager.OFFLOAD_MGR is empty_manager
+            assert empty_manager._is_warmup is True
+            assert empty_manager._cached_chunks_forward == []
+
+        assert model_config.fine_grained_activation_offloading is True
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_does_not_consume_warm_manager_chunks(
+        self, mock_get_fb: MagicMock
+    ) -> None:
+        """Logprob stages must not advance chunks cached by a prior training step."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        class StatefulOffloadManager:
+            def __init__(self) -> None:
+                self.do_offload = True
+                self.cached_forward_index = 0
+
+            def disable_offload(self) -> None:
+                self.do_offload = False
+
+            def enable_offload(self) -> None:
+                self.do_offload = True
+
+            def consume_cached_chunk(self) -> None:
+                if self.do_offload:
+                    self.cached_forward_index += 1
+
+            def reset(self) -> None:
+                self.cached_forward_index = 0
+
+        manager = StatefulOffloadManager()
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+        observed_phases: list[tuple[bool, int]] = []
+
+        def run_schedule(**kwargs: Any) -> dict[str, torch.Tensor]:
+            manager.consume_cached_chunk()
+            observed_phases.append(
+                (kwargs["forward_only"], manager.cached_forward_index)
+            )
+            if not kwargs["forward_only"]:
+                manager.reset()
+            return {}
+
+        mock_get_fb.return_value = run_schedule
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", manager):
+            for forward_only in (True, False, True, False):
+                megatron_forward_backward(
+                    model=model,
+                    data_iterator=iter([]),
+                    num_microbatches=1,
+                    seq_length=64,
+                    mbs=1,
+                    post_processing_fn=post_processor,
+                    forward_only=forward_only,
+                )
+
+                assert manager.do_offload is True
+
+        assert observed_phases == [(True, 0), (False, 1), (True, 0), (False, 1)]
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_preserves_disabled_manager_state(
+        self, mock_get_fb: MagicMock
+    ) -> None:
+        """Nested callers that disabled offload must remain disabled."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        manager = MagicMock()
+        manager.do_offload = False
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+
+        def run_forward_only(**kwargs: Any) -> dict[str, torch.Tensor]:
+            assert kwargs["forward_only"] is True
+            assert manager.do_offload is False
+            return {}
+
+        mock_get_fb.return_value = run_forward_only
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", manager):
+            megatron_forward_backward(
+                model=SimpleNamespace(config=model_config),
+                data_iterator=iter([]),
+                num_microbatches=1,
+                seq_length=64,
+                mbs=1,
+                post_processing_fn=post_processor,
+                forward_only=True,
+            )
+
+        manager.disable_offload.assert_not_called()
+        manager.enable_offload.assert_not_called()
+        assert manager.do_offload is False
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_restores_vpp_configs(self, mock_get_fb: MagicMock) -> None:
+        """Shared and distinct VPP configs are suspended and restored atomically."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        shared_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        distinct_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = [MagicMock(), MagicMock(), MagicMock()]
+
+        def run_forward_only(**kwargs: Any) -> dict[str, torch.Tensor]:
+            assert shared_config.fine_grained_activation_offloading is False
+            assert distinct_config.fine_grained_activation_offloading is False
+            return {}
+
+        mock_get_fb.return_value = run_forward_only
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with patch(
+            "nemo_rl.models.megatron.train.get_model_config",
+            side_effect=[shared_config, shared_config, distinct_config],
+        ):
+            megatron_forward_backward(
+                model=model,
+                data_iterator=iter([]),
+                num_microbatches=1,
+                seq_length=64,
+                mbs=1,
+                post_processing_fn=post_processor,
+                forward_only=True,
+            )
+
+        assert shared_config.fine_grained_activation_offloading is True
+        assert distinct_config.fine_grained_activation_offloading is True
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_config_discovery_is_atomic(
+        self, mock_get_fb: MagicMock
+    ) -> None:
+        """A later VPP wrapper error must not leave earlier configs disabled."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        first_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.train.get_model_config",
+                side_effect=[first_config, RuntimeError("invalid VPP wrapper")],
+            ),
+            pytest.raises(RuntimeError, match="invalid VPP wrapper"),
+        ):
+            megatron_forward_backward(
+                model=[MagicMock(), MagicMock()],
+                data_iterator=iter([]),
+                num_microbatches=1,
+                seq_length=64,
+                mbs=1,
+                post_processing_fn=post_processor,
+                forward_only=True,
+            )
+
+        mock_get_fb.return_value.assert_not_called()
+        assert first_config.fine_grained_activation_offloading is True
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_forward_only_restores_activation_offload_after_error(self, mock_get_fb):
+        """A failed forward-only stage must restore activation offload for training."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+
+        def fail_forward_only(**kwargs):
+            assert kwargs["forward_only"] is True
+            assert model_config.fine_grained_activation_offloading is False
+            raise RuntimeError("forward-only failure")
+
+        mock_get_fb.return_value = fail_forward_only
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        with pytest.raises(RuntimeError, match="forward-only failure"):
+            megatron_forward_backward(
+                model=model,
+                data_iterator=iter([]),
+                num_microbatches=1,
+                seq_length=64,
+                mbs=1,
+                post_processing_fn=post_processor,
+                forward_only=True,
+            )
+
+        assert model_config.fine_grained_activation_offloading is True
+
+    @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
+    def test_training_keeps_activation_offload_enabled(self, mock_get_fb):
+        """Training must retain activation offload so MCore can warm up and run it."""
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            megatron_forward_backward,
+        )
+
+        model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+        model = SimpleNamespace(config=model_config)
+
+        def run_training(**kwargs):
+            assert kwargs["forward_only"] is False
+            assert model_config.fine_grained_activation_offloading is True
+            return {"loss": torch.tensor(0.5)}
+
+        mock_get_fb.return_value = run_training
+        post_processor = LossPostProcessor(
+            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+        )
+
+        megatron_forward_backward(
+            model=model,
+            data_iterator=iter([]),
+            num_microbatches=1,
+            seq_length=64,
+            mbs=1,
+            post_processing_fn=post_processor,
+            forward_only=False,
+        )
+
+        assert model_config.fine_grained_activation_offloading is True
 
 
 class TestLossPostProcessor:
@@ -902,27 +1463,31 @@ class TestLogprobsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            return_value=torch.tensor([[1, 2, 3, 4, 5]])
+            return_value=torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
         )
 
-        mock_logprobs = torch.randn(1, 4)  # One less than input length
+        mock_logprobs = torch.randn(1, 7)  # One less than padded input length
         mock_from_logits.return_value = mock_logprobs
 
         wrapped_fn = processor(
             data_dict=mock_data_dict,
-            input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]]),
             cu_seqlens_padded=None,
+            original_seq_length=5,
         )
 
-        output_tensor = torch.randn(1, 5, 100)
+        output_tensor = torch.randn(1, 8, 100)
         loss, result = wrapped_fn(output_tensor)
 
         # Loss should be 0
         assert loss.item() == 0.0
         # Result should have logprobs key
         assert "logprobs" in result
-        # Logprobs should be prepended with a 0
-        assert result["logprobs"].shape[1] == 5
+        # Logprobs should be prepended with a 0 and dense padding removed
+        expected = torch.cat(
+            [torch.zeros_like(mock_logprobs[:, :1]), mock_logprobs], dim=1
+        )[:, :5]
+        assert torch.equal(result["logprobs"], expected)
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -957,6 +1522,7 @@ class TestLogprobsPostProcessor:
             data_dict=mock_data_dict,
             input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
             cu_seqlens_padded=torch.tensor([0, 5]),
+            original_seq_length=5,
         )
 
         output_tensor = torch.randn(1, 5, 100)
@@ -990,26 +1556,28 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5]])
-            if key == "input_ids"
-            else torch.tensor([5])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
+                if key == "input_ids"
+                else torch.tensor([5])
+            )
         )
 
-        mock_topk_vals = torch.randn(1, 5, k)
-        mock_topk_idx = torch.randint(0, 100, (1, 5, k))
+        mock_topk_vals = torch.randn(1, 8, k)
+        mock_topk_idx = torch.randint(0, 100, (1, 8, k))
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=None,
+            original_seq_length=5,
         )
 
-        output_tensor = torch.randn(1, 5, 100)
+        output_tensor = torch.randn(1, 8, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        assert "topk_logits" in result
-        assert "topk_indices" in result
-        assert result["topk_logits"].shape[-1] == k
+        assert torch.equal(result["topk_logits"], mock_topk_vals[:, :5])
+        assert torch.equal(result["topk_indices"], mock_topk_idx[:, :5])
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1034,9 +1602,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
-            if key == "input_ids"
-            else torch.tensor([5])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
+                if key == "input_ids"
+                else torch.tensor([5])
+            )
         )
 
         mock_topk_vals = torch.randn(1, 8, k)
@@ -1048,6 +1618,7 @@ class TestTopkLogitsPostProcessor:
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=8,
         )
 
         output_tensor = torch.randn(1, 8, 100)
@@ -1082,9 +1653,9 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3]])
-            if key == "input_ids"
-            else torch.tensor([3])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3]]) if key == "input_ids" else torch.tensor([3])
+            )
         )
 
         mock_topk.return_value = (
@@ -1092,7 +1663,11 @@ class TestTopkLogitsPostProcessor:
             torch.randint(0, 100, (1, 3, 5)),
         )
 
-        wrapped_fn = processor(data_dict=mock_data_dict, cu_seqlens_padded=None)
+        wrapped_fn = processor(
+            data_dict=mock_data_dict,
+            cu_seqlens_padded=None,
+            original_seq_length=3,
+        )
 
         output_tensor = torch.randn(1, 3, 100)
 
@@ -1130,9 +1705,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-            if key == "input_ids"
-            else torch.tensor([8])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+                if key == "input_ids"
+                else torch.tensor([8])
+            )
         )
 
         # distributed_vocab_topk returns local (CP-sharded) results
@@ -1150,6 +1727,7 @@ class TestTopkLogitsPostProcessor:
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=8,
         )
 
         output_tensor = torch.randn(1, local_seq_len, 100)
@@ -1196,9 +1774,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.zeros(2, unpacked_seqlen, dtype=torch.long)
-            if key == "input_ids"
-            else torch.tensor([seq1_len, seq2_len])
+            side_effect=lambda key: (
+                torch.zeros(2, unpacked_seqlen, dtype=torch.long)
+                if key == "input_ids"
+                else torch.tensor([seq1_len, seq2_len])
+            )
         )
 
         # distributed_vocab_topk returns local (CP-sharded) results
@@ -1218,6 +1798,7 @@ class TestTopkLogitsPostProcessor:
         wrapped_fn = processor(
             data_dict=mock_data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            original_seq_length=unpacked_seqlen,
         )
 
         output_tensor = torch.randn(1, local_packed_len, 100)

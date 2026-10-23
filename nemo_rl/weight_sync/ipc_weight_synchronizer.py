@@ -56,7 +56,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         self,
         policy: Any,
         generation: Any,
-        refit_buffer_size_gb: Optional[int] = None,
+        refit_buffer_size_gb: Optional[float | int] = None,
     ):
         self._policy = policy
         self._generation = generation
@@ -83,7 +83,8 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                 buffer_size_bytes = self._compute_buffer_size()
 
                 futures_train = self._policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
+                    buffer_size_bytes=buffer_size_bytes,
+                    kv_scales=kv_scales,
                 )
                 futures_inference = self._generation.update_weights_via_ipc_zmq()
 
@@ -107,11 +108,10 @@ class IPCWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
-    def mark_stale(self) -> None:
-        self._stale = True
-
     def init_communicator(self) -> None:
-        state_dict_info = self._policy.prepare_refit_info()
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
     def shutdown(self) -> None:
@@ -121,7 +121,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         if self._refit_buffer_size_gb is not None:
             if self._refit_buffer_size_gb <= 0:
                 raise ValueError("refit_buffer_size_gb must be > 0")
-            return self._refit_buffer_size_gb * (1024**3)
+            return int(self._refit_buffer_size_gb * (1024**3))
 
         memory_ratio_raw = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
         try:
