@@ -139,7 +139,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.telemetry.setup import init_telemetry_worker
-from nemo_rl.utils import hbm_spill
+from nemo_rl.utils import hbm_spill, nccl_warmup
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -735,6 +735,7 @@ class MegatronPolicyWorkerImpl(
         self.model = model_and_optimizer_state.model
         self.optimizer = model_and_optimizer_state.optimizer
         hbm_spill.install(self.optimizer, self.rank)
+        nccl_warmup.warm_up(self.rank)
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
