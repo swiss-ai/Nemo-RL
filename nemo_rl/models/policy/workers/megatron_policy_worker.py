@@ -139,7 +139,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.telemetry.setup import init_telemetry_worker
-from nemo_rl.utils import hbm_spill, nccl_warmup
+from nemo_rl.utils import failure_forensics, hbm_spill, nccl_warmup
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -636,6 +636,7 @@ class MegatronPolicyWorkerImpl(
             f"device drift after setup_distributed: current_device="
             f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
         )
+        failure_forensics.install(self.rank)
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
@@ -979,6 +980,7 @@ class MegatronPolicyWorkerImpl(
         self.model.load_state_dict(extra_state, strict=False)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
+    @failure_forensics.dump_on_failure
     def train(
         self,
         data: BatchedDataDict,
@@ -1515,6 +1517,7 @@ class MegatronPolicyWorkerImpl(
         Args:
             tag: Phase-boundary name this sample belongs to.
         """
+        failure_forensics.set_phase(tag)
         if not torch.cuda.is_available() or not log.isEnabledFor(logging.DEBUG):
             return
         dev = torch.cuda.current_device()
@@ -2243,6 +2246,7 @@ class MegatronPolicyWorkerImpl(
             self._train_step_state = None
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
+    @failure_forensics.dump_on_failure
     def get_logprobs(
         self,
         *,
