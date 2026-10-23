@@ -91,6 +91,7 @@ from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
     build_video_preprocessing_config,
+    context_capped_max_new_tokens,
     log_gpu_memory,
     resolve_torch_dtype,
     sample_vision_tensors,
@@ -960,10 +961,16 @@ class MegatronGenerationMixin:
         self,
         greedy: bool,
         stop_words: Optional[list[str]],
+        prompt_length: int,
         *,
         return_prompt_tokens: bool = False,
     ) -> SamplingParams:
-        """Build mcore SamplingParams for a single request."""
+        """Build mcore SamplingParams for a single request.
+
+        The engine fails any request whose prompt plus ``num_tokens_to_generate``
+        exceeds its max sequence length, so the generation budget is capped to
+        the context left after the prompt, as the vLLM worker does.
+        """
         top_k_cfg = self.cfg["generation"]["top_k"]
         top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
 
@@ -978,7 +985,13 @@ class MegatronGenerationMixin:
             top_p=top_p_val,
             skip_prompt_log_probs=True,
             return_log_probs=True,
-            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
+            num_tokens_to_generate=context_capped_max_new_tokens(
+                configured_max_new_tokens=self.cfg["generation"]["max_new_tokens"],
+                input_length=prompt_length,
+                max_model_len=self.cfg["generation"]["mcore_generation_config"][
+                    "max_model_len"
+                ],
+            ),
             termination_id=self.megatron_tokenizer.eod,
             stop_words=stop_words,
             return_prompt_tokens=return_prompt_tokens,
@@ -1048,6 +1061,7 @@ class MegatronGenerationMixin:
                 self._build_sampling_params(
                     greedy,
                     stop_words,
+                    len(prompt),
                     return_prompt_tokens=multi_modal_data is not None,
                 )
             )

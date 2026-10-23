@@ -14,25 +14,46 @@
 
 from typing import Any
 
-from datasets import load_dataset
+import numpy as np
+import pyarrow.compute as pc
+from datasets import Dataset, load_dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class DAPOMath17KDataset(RawDataset):
-    """Simple wrapper around the DAPO Math 17K dataset with train split."""
+    """Simple wrapper around the DAPO Math 17K dataset with train split.
 
-    def __init__(self, **kwargs) -> None:
+    Args:
+        deduplicate: Keep only the first row of each distinct prompt. The upload
+            repeats each of its ~17.4k problems about 100 times (1.79M rows).
+    """
+
+    def __init__(self, deduplicate: bool = False, **kwargs) -> None:
         self.task_name = "DAPOMath17K"
 
         # load from huggingface
         self.dataset = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
+        if deduplicate:
+            self.dataset = self._deduplicate(self.dataset)
 
         # format the dataset
         self.dataset = self.dataset.map(
             self.format_data,
             remove_columns=self.dataset.column_names,
         )
+
+    @staticmethod
+    def _deduplicate(dataset: Dataset) -> Dataset:
+        prompts = pc.struct_field(
+            pc.list_element(dataset.data.column("prompt"), 0), "content"
+        )
+        codes = pc.index_in(prompts, value_set=pc.unique(prompts)).to_numpy()
+        first_rows = np.sort(np.unique(codes, return_index=True)[1])
+        print(
+            f"DAPOMath17K: kept {len(first_rows)} distinct prompts of {len(dataset)} rows"
+        )
+        return dataset.select(first_rows)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
