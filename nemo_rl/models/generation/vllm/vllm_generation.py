@@ -880,7 +880,10 @@ class VllmGeneration(GenerationInterface):
         )
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
+        # Torch ranks already include the native DP offset within each instance.
+        instance_width = membership.workers_per_shard * self.vllm_dp_size
         for shard_idx, rank_prefix in membership.shard_prefixes.items():
+            instance_rank_prefix = rank_prefix // instance_width * instance_width
             leader_idx = shard_idx * membership.workers_per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
@@ -889,7 +892,7 @@ class VllmGeneration(GenerationInterface):
                 )
             futures.append(
                 getattr(workers[leader_idx], method_name).remote(
-                    rank_prefix=rank_prefix,
+                    rank_prefix=instance_rank_prefix,
                     ip=ip,
                     port=port,
                     world_size=membership.world_size,
@@ -1463,11 +1466,14 @@ class VllmGeneration(GenerationInterface):
         )
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
+        # Use the same instance prefix for every native DP rank.
+        instance_width = membership.workers_per_shard * self.vllm_dp_size
         for shard_idx, rank_prefix in membership.shard_prefixes.items():
+            instance_rank_prefix = rank_prefix // instance_width * instance_width
             leader = workers[shard_idx * membership.workers_per_shard]
             futures.append(
                 getattr(leader, method_name).remote(
-                    rank_prefix=rank_prefix,
+                    rank_prefix=instance_rank_prefix,
                     pp_ips=pp_ips,
                     pp_ports=pp_ports,
                     pp_size=pp_size,
