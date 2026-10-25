@@ -60,7 +60,6 @@ from nemo_rl.models.generation.vllm.video_utils import (
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     find_tokenizer_required_architectures,
-    resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
@@ -581,23 +580,35 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.expert_parallel_size > self.tensor_parallel_size:
-            # set vLLM DP rank
-            world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
-            rank = int(os.environ["RANK"]) % world_size
-            os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str(
-                resolve_data_parallel_local_rank(
-                    rank, model_parallel_size, executor_backend
-                )
+            vllm_dp_size = self.expert_parallel_size // self.tensor_parallel_size
+            world_size_across_dp = vllm_dp_size * model_parallel_size
+            rank_in_world_across_dp = int(os.environ["RANK"]) % world_size_across_dp
+            vllm_dp_rank = rank_in_world_across_dp // model_parallel_size
+            leader_rank = (
+                int(os.environ["RANK"]) // world_size_across_dp * world_size_across_dp
             )
-            # set vLLM DP address and port
-            leader_rank = int(os.environ["RANK"]) // world_size * world_size
             addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
+            dp_addr = addr_list[leader_rank]
             port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
-            os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
-            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
+            dp_port = port_list[leader_rank]
+            use_sync_engine = not self.cfg["vllm_cfg"]["async_engine"]
+            if use_sync_engine:
+                # set vLLM DP flags according to https://github.com/vllm-project/vllm/blob/main/examples/features/data_parallel/data_parallel_offline.py
+                os.environ["VLLM_DP_SIZE"] = str(vllm_dp_size)
+                os.environ["VLLM_DP_RANK"] = str(vllm_dp_rank)
+                # Each worker only sees its DP rank's GPUs. A nonzero local rank
+                # can hang worker initialization.
+                os.environ["VLLM_DP_RANK_LOCAL"] = str(0)
+                os.environ["VLLM_DP_MASTER_IP"] = str(dp_addr)
+                os.environ["VLLM_DP_MASTER_PORT"] = str(dp_port)
+            else:
+                # set vLLM DP arguments according to https://docs.vllm.ai/en/latest/serving/data_parallel_deployment/#external-load-balancing
+                vllm_kwargs["data_parallel_size"] = vllm_dp_size
+                vllm_kwargs["data_parallel_rank"] = vllm_dp_rank
+                vllm_kwargs["data_parallel_external_lb"] = True
+                vllm_kwargs["data_parallel_address"] = str(dp_addr)
+                vllm_kwargs["data_parallel_rpc_port"] = dp_port
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
