@@ -3265,6 +3265,7 @@ class TestAsyncTrajectoryCollector:
         [
             ("num_generations_per_prompt", 1, "at least two generations"),
             ("dynamic_sampling_max_gen_batches", 0, "must be positive"),
+            ("batch_multiplier", 0, "at least one candidate prompt"),
         ],
     )
     def test_dynamic_sampling_rejects_invalid_config(
@@ -3674,9 +3675,13 @@ class TestAsyncTrajectoryCollector:
         assert metrics["reward"] == pytest.approx(1 / 6)
         assert metrics["filtered_reward"] == pytest.approx(1 / 3)
 
-    def test_dynamic_sampling_counts_candidates_not_dispatches(self, monkeypatch):
+    @pytest.mark.parametrize("multiplier", [1.0, 1.1, 3.0])
+    def test_dynamic_sampling_counts_candidates_not_dispatches(
+        self, monkeypatch, multiplier
+    ):
         config = self.create_mock_config()
         config.grpo.num_prompts_per_step = 64
+        config.grpo.batch_multiplier = multiplier
         monkeypatch.setattr(self, "create_mock_config", lambda: config)
         replay_buffer = mock.MagicMock()
         replay_buffer.has_complete_batch.remote = mock.AsyncMock(return_value=False)
@@ -3716,19 +3721,23 @@ class TestAsyncTrajectoryCollector:
             dispatch(count)
             collector.check_health()
         assert collector._dynamic_sampling_candidates == {3: 180}
-        assert (
-            collector.drain_dynamic_sampling_metrics()[
-                "dynamic_sampling_num_gen_batches"
-            ]
-            == 180 / 64
-        )
-        # First-stage budget: 10 * 64 candidates. Multiplier support is separate.
-        for _ in range(7):
+        assert collector.drain_dynamic_sampling_metrics()[
+            "dynamic_sampling_num_gen_batches"
+        ] == pytest.approx(180 / int(64 * multiplier))
+        budget = 10 * int(64 * multiplier)
+        assert collector._dynamic_sampling_candidate_budget == budget
+        full_dispatches, tail = divmod(budget - 180 - 1, 64)
+        for _ in range(full_dispatches):
             dispatch(64)
             collector.check_health()
-        assert collector._dynamic_sampling_candidates[3] == 628
-        dispatch(12)
-        with pytest.raises(RuntimeError, match="640/640 candidate prompt groups"):
+        if tail:
+            dispatch(tail)
+            collector.check_health()
+        assert collector._dynamic_sampling_candidates[3] == budget - 1
+        dispatch(1)
+        with pytest.raises(
+            RuntimeError, match=f"{budget}/{budget} candidate prompt groups"
+        ):
             collector.check_health()
 
     def test_dynamic_sampling_candidate_counts_follow_consumed_targets(
@@ -3749,6 +3758,9 @@ class TestAsyncTrajectoryCollector:
         assert collector._dynamic_sampling_candidates == {}
 
     def test_dynamic_sampling_replay_ready_before_stream_finishes(self, monkeypatch):
+        config = self.create_mock_config()
+        config.grpo.batch_multiplier = 3
+        monkeypatch.setattr(self, "create_mock_config", lambda: config)
         buffer = ReplayBufferImpl(max_size=4, drop_incomplete_targets_on_restore=False)
         replay_buffer = mock.MagicMock()
         collector = self.create_local_collector(
@@ -3792,6 +3804,8 @@ class TestAsyncTrajectoryCollector:
             try:
                 await asyncio.wait_for(ready.wait(), timeout=10)
                 assert not worker.done()
+                assert collector._dynamic_sampling_candidates[3] == 2
+                assert collector._dynamic_sampling_candidate_batch_size == 6
                 sampled = buffer.sample(2, 3, 2)
                 assert sampled is not None and len(sampled["trajectories"]) == 2
             finally:

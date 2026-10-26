@@ -47,11 +47,11 @@ fill each target training batch's remaining slots. Discarded groups are not
 retried as failed rollouts.
 
 `dynamic_sampling_max_gen_batches` limits candidates per target to
-`dynamic_sampling_max_gen_batches × num_prompts_per_step`. Each candidate group
-with valid rewards counts once, whether retained or discarded. `batch_multiplier`
-does not change this limit. Training starts as soon as enough useful groups are
-ready. An incomplete target at the limit stops collection with an error. Counters
-reset after target consumption and on checkpoint resume.
+`dynamic_sampling_max_gen_batches × int(num_prompts_per_step × batch_multiplier)`.
+Each candidate group with valid rewards counts once, whether retained or discarded.
+Training starts as soon as enough useful groups are ready; it does not wait for a
+full candidate batch. An incomplete target at the limit stops collection with an
+error. Counters reset after target consumption and on checkpoint resume.
 
 Optional reward scaling and shaping run after replay sampling, in the same order
 as sync GRPO: `scale_rewards`, then `apply_reward_shaping`, then advantage computation.
@@ -72,7 +72,8 @@ Dynamic sampling is still unsupported by the single-controller path.
 
 The collector uses the sync DAPO metric names under `collection/dynamic_sampling/`:
 - `dynamic_sampling_num_gen_batches`: candidates evaluated in the interval divided
-  by `num_prompts_per_step`, including fractional batches. Internal stream retries
+  by `int(num_prompts_per_step × batch_multiplier)`, including fractional batches.
+  Internal stream retries
   do not consume another candidate batch.
 - `dynamic_sampling_num_discarded_valid_samples`: always zero, since async gap filling
   does not overfill a target and discard excess useful samples.

@@ -214,7 +214,19 @@ class AsyncTrajectoryCollector:
                 )
             if algorithm_config.dynamic_sampling_max_gen_batches <= 0:
                 raise ValueError("dynamic_sampling_max_gen_batches must be positive")
+
         self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
+        self._dynamic_sampling_candidate_batch_size = int(
+            self._num_prompts_per_step * algorithm_config.batch_multiplier
+        )
+        if (
+            self._use_dynamic_sampling
+            and self._dynamic_sampling_candidate_batch_size < 1
+        ):
+            raise ValueError(
+                "batch_multiplier must provide at least one candidate prompt"
+            )
+
         self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
         self._max_rollout_turns = algorithm_config.max_rollout_turns
         self.replay_buffer = replay_buffer
@@ -355,7 +367,7 @@ class AsyncTrajectoryCollector:
     @property
     def _dynamic_sampling_candidate_budget(self) -> int:
         return (
-            self._num_prompts_per_step
+            self._dynamic_sampling_candidate_batch_size
             * self.algorithm_config.dynamic_sampling_max_gen_batches
         )
 
@@ -1410,7 +1422,7 @@ class AsyncTrajectoryCollector:
 
         Names mirror synchronous DAPO, but intervals overlap training and do not
         describe its sampled batch. Generation batches count evaluated candidates
-        divided by the training prompt count, including fractional batches, not
+        divided by the multiplied candidate-batch size, including fractions, not
         dispatches or internal stream retries. Reward means use the filtering
         rewards and include regenerated results; candidate counts charge each
         prompt only once within a worker.
@@ -2064,7 +2076,8 @@ class AsyncTrajectoryCollector:
                                 stats = self._dynamic_sampling_metrics
                                 key = "dynamic_sampling_num_gen_batches"
                                 stats[key] = (
-                                    stats.get(key, 0) + 1 / self._num_prompts_per_step
+                                    stats.get(key, 0)
+                                    + 1 / self._dynamic_sampling_candidate_batch_size
                                 )
                             counted_candidate_indices.add(group_index)
                         # Exact equality matches synchronous DAPO's trivial group
