@@ -6031,6 +6031,17 @@ def async_grpo_train(
             if payload_metrics:
                 logger.log_metrics(payload_metrics, step + 1, prefix="")
 
+            if master_config.grpo.use_dynamic_sampling:
+                collection_metrics = ray.get(
+                    trajectory_collector.drain_dynamic_sampling_metrics.remote()
+                )
+                if collection_metrics:
+                    logger.log_metrics(
+                        collection_metrics,
+                        step + 1,
+                        prefix="collection/dynamic_sampling",
+                    )
+
             if refit_metrics:
                 logger.log_metrics(refit_metrics, step + 1, prefix="refit")
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")

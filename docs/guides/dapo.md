@@ -54,6 +54,21 @@ count; larger dataloader batches are carried over rather than discarded.
 Reward scaling and reward shaping remain unsupported in this async path. Dynamic
 sampling is still unsupported by the single-controller path.
 
+The collector uses the sync DAPO metric names under `collection/dynamic_sampling/`:
+- `dynamic_sampling_num_gen_batches`: generation batch workers started in the interval,
+  excluding internal stream retries (unlike sync's per-training-batch round count).
+- `dynamic_sampling_num_discarded_valid_samples`: always zero, since async gap filling
+  does not overfill a target and discard excess useful samples.
+- `reward` and `filtered_reward`: sample-weighted mean rewards before and after
+  filtering (unshaped rewards when available).
+
+These are drain-to-drain **collection intervals**, not metrics for the trainer's
+sampled batch. Passing filtering does not guarantee a group has been buffered or
+trained yet. Completed groups skipped during stream recovery are not counted again;
+fresh generations are. Empty intervals emit no metrics, and reward means with no
+samples are omitted. Counters reset after draining and on checkpoint resume.
+Equal-reward discards are also printed in collector logs.
+
 ### About batch_multiplier
 
 `batch_multiplier` (a float ≥ 1.0) controls the initial prompt pool size by sampling `batch_multiplier × num_prompts_per_step` prompts before dynamic sampling. Higher values increase memory and compute requirements, while very low values (e.g., 1.0) may slow the cache accumulation of prompt groups with nonzero standard deviation. The optimal value depends on the dataset, model capacity, and overall training setup.  When **dynamic sampling** is enabled, we also log two additional metrics:

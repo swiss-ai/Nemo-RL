@@ -204,6 +204,8 @@ class AsyncTrajectoryCollector:
             and master_config.grpo.use_dynamic_sampling
         )
         self._dynamic_sampling_rounds: dict[int, int] = {}
+        self._dynamic_sampling_metrics: dict[str, int | float] = {}
+        self._dynamic_sampling_metrics_lock = _threading.Lock()
         if self._use_dynamic_sampling:
             if algorithm_config.num_generations_per_prompt < 2:
                 raise ValueError(
@@ -1345,6 +1347,53 @@ class AsyncTrajectoryCollector:
             # spin; the caller's drain loop comes back to it.
             time.sleep(0.01)
 
+    def _record_dynamic_sampling_metrics(
+        self, rewards: torch.Tensor, *, retained: bool
+    ) -> None:
+        """Record one completed rollout group's filtering decision."""
+        reward_sum = float(rewards.double().sum().item())
+        reward_count = rewards.numel()
+        with self._dynamic_sampling_metrics_lock:
+            stats = self._dynamic_sampling_metrics
+            stats["reward_sum"] = stats.get("reward_sum", 0.0) + reward_sum
+            stats["reward_count"] = stats.get("reward_count", 0) + reward_count
+            if retained:
+                stats["filtered_reward_sum"] = (
+                    stats.get("filtered_reward_sum", 0.0) + reward_sum
+                )
+                stats["filtered_reward_count"] = (
+                    stats.get("filtered_reward_count", 0) + reward_count
+                )
+
+    def drain_dynamic_sampling_metrics(self) -> dict[str, int | float]:
+        """Return and reset collection-interval DAPO metrics atomically.
+
+        Names mirror synchronous DAPO, but intervals overlap training and do not
+        describe its sampled batch. Generation batches count worker starts, not
+        internal stream retries. Rewards are those used for filtering. Completed
+        groups skipped on recovery are not counted again; fresh generations are.
+        """
+        with self._dynamic_sampling_metrics_lock:
+            stats = self._dynamic_sampling_metrics
+            self._dynamic_sampling_metrics = {}
+
+        if not stats:
+            return {}
+        metrics: dict[str, int | float] = {
+            "dynamic_sampling_num_gen_batches": stats.get(
+                "dynamic_sampling_num_gen_batches", 0
+            ),
+            # Gap filling never generates more than the missing prompt count.
+            "dynamic_sampling_num_discarded_valid_samples": 0,
+        }
+
+        for name in ("reward", "filtered_reward"):
+            count = stats.get(f"{name}_count", 0)
+            if count:
+                metrics[name] = stats[f"{name}_sum"] / count
+
+        return metrics
+
     async def drain_payload_metrics(self) -> dict[str, int | float]:
         """Close one drain-to-drain collector/Gym telemetry interval.
 
@@ -1628,6 +1677,10 @@ class AsyncTrajectoryCollector:
                         self._dynamic_sampling_rounds.get(target_weight_version, 0) + 1
                     )
                     self._dynamic_sampling_rounds[target_weight_version] = rounds
+                with self._dynamic_sampling_metrics_lock:
+                    stats = self._dynamic_sampling_metrics
+                    key = "dynamic_sampling_num_gen_batches"
+                    stats[key] = stats.get(key, 0) + 1
             await self._collect_rollout_batch(
                 repeated_batch=repeated_batch,
                 generation_weight_version=generation_weight_version,
@@ -1955,12 +2008,21 @@ class AsyncTrajectoryCollector:
                                 "Async dynamic sampling requires finite rewards"
                             )
                         # Exact equality matches synchronous DAPO's trivial group
-                        if torch.all(rewards == rewards[0]):
+                        retained = not bool(torch.all(rewards == rewards[0]))
+                        self._record_dynamic_sampling_metrics(
+                            rewards, retained=retained
+                        )
+                        if not retained:
                             completed_group_indices.add(group_index)
                             task_index = group_input_task_indices[group_index]
                             if task_index is not None:
                                 with self._outstanding_lock:
                                     self._outstanding_task_indices.discard(task_index)
+                            print(
+                                "Discarded equal-reward prompt group "
+                                f"(group_index={group_index}, "
+                                f"target_weight={target_weight_version})"
+                            )
                             # Discard group from replay buffer.
                             continue
                     push_tasks.append(

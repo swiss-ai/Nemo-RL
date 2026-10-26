@@ -1297,6 +1297,13 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
+    def drain_dynamic_sampling_metrics(self):
+        """Return an empty collection interval by default."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
     def get_dataloader_state(self):
         """Return a remote-callable mock yielding a checkpointable dataloader state.
 
@@ -1544,6 +1551,64 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+@pytest.mark.parametrize(
+    "enabled,has_metrics", [(False, True), (True, False), (True, True)]
+)
+def test_async_grpo_logs_dynamic_sampling_collection_interval(
+    mock_grpo_components, enabled, has_metrics
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = enabled
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = False
+    collection_metrics = (
+        {
+            "dynamic_sampling_num_gen_batches": 2,
+            "dynamic_sampling_num_discarded_valid_samples": 0,
+            "reward": 0.5,
+            "filtered_reward": 0.75,
+        }
+        if has_metrics
+        else {}
+    )
+    drain = MagicMock()
+    drain.remote.return_value = collection_metrics
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {"mean_gen_tokens_per_sample": 2.0}),
+        patch.object(
+            StubAsyncTrajectoryCollector, "drain_dynamic_sampling_metrics", drain
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+    assert drain.remote.call_count == int(enabled)
+    logged = [
+        call
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "collection/dynamic_sampling"
+    ]
+    assert len(logged) == int(enabled and has_metrics)
+    if logged:
+        assert logged[0].args == (collection_metrics, 1)
 
 
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
