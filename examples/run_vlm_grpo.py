@@ -148,8 +148,6 @@ def main() -> None:
     print("=" * 60 + "\n", flush=True)
 
     if config.grpo.async_grpo.enabled:
-        if config.grpo.reward_scaling.enabled:
-            raise NotImplementedError("reward_scaling is not supported with async GRPO")
         if config.data["use_multiple_dataloader"]:
             raise NotImplementedError(
                 "use_multiple_dataloader is not supported with async GRPO"

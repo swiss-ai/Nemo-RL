@@ -168,12 +168,6 @@ def main() -> None:
         try:
             # Check if async mode is enabled
             if config.grpo.async_grpo.enabled:
-                # Reward scaling is not yet supported by async GRPO.
-                if config.grpo.reward_scaling.enabled:
-                    raise NotImplementedError(
-                        "reward_scaling is not supported with async GRPO"
-                    )
-
                 # Async GRPO does not support multiple dataloaders
                 if config.data["use_multiple_dataloader"]:
                     raise NotImplementedError(

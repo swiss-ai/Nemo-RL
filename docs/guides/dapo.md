@@ -40,7 +40,8 @@ Standard GRPO trains on all generated responses, even when they have identical r
 Dynamic sampling is also supported by the legacy async GRPO loop
 (`grpo.async_grpo.enabled: true`). Set `grpo.use_dynamic_sampling: true`
 and use at least two generations per prompt. The trajectory collector discards
-completed prompt groups with identical rewards before replay insertion. The replay
+completed prompt groups with identical unshaped rewards (after optional scaling)
+before replay insertion. The replay
 buffer accumulates retained groups, and the collector generates new prompts to
 fill each target training batch's remaining slots. Discarded groups are not
 retried as failed rollouts.
@@ -51,16 +52,22 @@ health check. This counter restarts on checkpoint resume. Unlike synchronous
 oversampling, each async dispatch generates at most the target's missing prompt
 count; larger dataloader batches are carried over rather than discarded.
 
-Optional reward shaping is applied by the async trainer after replay sampling,
-using the same `apply_reward_shaping` implementation as sync GRPO. Enable it with
-`grpo.reward_shaping.enabled: true` and configure the overlong penalty (or
-`stop_properly_penalty_coef`). Dynamic sampling and collector reward metrics use
-original rewards; advantages and training reward logs use shaped rewards. Thus
-length penalties cannot make an otherwise equal-reward group pass filtering, and
-replayed groups are not penalized twice.
+Optional reward scaling and shaping run after replay sampling, in the same order
+as sync GRPO: `scale_rewards`, then `apply_reward_shaping`, then advantage computation.
+Enable scaling with `grpo.reward_scaling.enabled: true` and set the source and target
+ranges. Scaling clamps rewards to the source range before mapping them to the target
+range. It also processes named GDPO reward components. Enable shaping separately
+with `grpo.reward_shaping.enabled: true` and configure the overlong penalty (or
+`stop_properly_penalty_coef`).
 
-Reward scaling remains unsupported in this async path. Dynamic sampling is still
-unsupported by the single-controller path.
+For dynamic sampling, the collector scales a reward copy before testing equality.
+This also rejects groups whose rewards become equal after clamping, as in sync GRPO.
+The replay buffer keeps original rewards, so the trainer does not scale them twice.
+Collector reward metrics use scaled, unshaped rewards; advantages and training reward
+logs use rewards after scaling and shaping. Length penalties cannot make an
+otherwise equal-reward group pass filtering.
+
+Dynamic sampling is still unsupported by the single-controller path.
 
 The collector uses the sync DAPO metric names under `collection/dynamic_sampling/`:
 - `dynamic_sampling_num_gen_batches`: generation batch workers started in the interval,
@@ -68,7 +75,7 @@ The collector uses the sync DAPO metric names under `collection/dynamic_sampling
 - `dynamic_sampling_num_discarded_valid_samples`: always zero, since async gap filling
   does not overfill a target and discard excess useful samples.
 - `reward` and `filtered_reward`: sample-weighted mean rewards before and after
-  filtering (unshaped rewards when available).
+  filtering (after optional scaling, before shaping).
 
 These are drain-to-drain **collection intervals**, not metrics for the trainer's
 sampled batch. Passing filtering does not guarantee a group has been buffered or

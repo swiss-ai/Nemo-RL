@@ -3277,6 +3277,8 @@ class TestAsyncTrajectoryCollector:
             replay_buffer=replay_buffer, use_dynamic_sampling=True
         )
         collector.running = True
+        # Clamping must not hide invalid rollout rewards.
+        collector.master_config.grpo.reward_scaling.enabled = True
 
         async def groups(**kwargs):
             yield trajectory_collector_mod.RolloutGroupResult(
@@ -3368,6 +3370,54 @@ class TestAsyncTrajectoryCollector:
         else:
             assert metrics == {}
         assert collector.drain_dynamic_sampling_metrics() == {}
+
+    def test_dynamic_sampling_scales_filter_copy_but_keeps_replay_raw(
+        self, monkeypatch
+    ):
+        replay_buffer = mock.MagicMock()
+        replay_buffer.add.remote = mock.AsyncMock(return_value="success")
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, use_dynamic_sampling=True
+        )
+        collector.running = True
+        cfg = collector.master_config.grpo.reward_scaling
+        cfg.enabled = True
+        cfg.source_min, cfg.source_max = 0.0, 1.0
+        cfg.target_min, cfg.target_max = -1.0, 1.0
+        raw_rewards = [
+            torch.tensor([-2.0, -1.0, -0.5]),
+            torch.tensor([-2.0, 0.25, 2.0]),
+        ]
+        batches = [
+            BatchedDataDict({"total_reward": rewards.clone()})
+            for rewards in raw_rewards
+        ]
+
+        async def groups(**kwargs):
+            for index, batch in enumerate(batches):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=index, final_batch=batch, rollout_metrics={}
+                )
+
+        monkeypatch.setattr(collector, "_iter_rollout_groups", groups)
+        asyncio.run(
+            collector._collect_rollout_batch(
+                repeated_batch=self.create_mock_batch(size=2).repeat_interleave(3),
+                generation_weight_version=2,
+                target_weight_version=3,
+                num_generations=3,
+                use_nemo_gym=False,
+            )
+        )
+        # The first group becomes equal after clamping; only the second survives.
+        replay_buffer.add.remote.assert_awaited_once()
+        buffered_batch = replay_buffer.add.remote.await_args.args[0]["batch"]
+        torch.testing.assert_close(buffered_batch["total_reward"], raw_rewards[1])
+        for batch, rewards in zip(batches, raw_rewards):
+            torch.testing.assert_close(batch["total_reward"], rewards)
+        metrics = collector.drain_dynamic_sampling_metrics()
+        assert metrics["reward"] == pytest.approx(-7 / 12)
+        assert metrics["filtered_reward"] == pytest.approx(-1 / 6)
 
     @pytest.mark.parametrize("retained", [False, True])
     def test_dynamic_sampling_metrics_empty_subgroups(self, retained):

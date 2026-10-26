@@ -1611,10 +1611,20 @@ def test_async_grpo_logs_dynamic_sampling_collection_interval(
         assert logged[0].args == (collection_metrics, 1)
 
 
-@pytest.mark.parametrize("dynamic_sampling", [False, True])
-@pytest.mark.parametrize("shaping", ["disabled", "overlong", "stop_properly"])
-def test_async_grpo_reward_shaping_before_advantages(
-    mock_grpo_components, dynamic_sampling, shaping
+@pytest.mark.parametrize(
+    "shaping,dynamic_sampling,scaling",
+    [
+        ("disabled", False, False),
+        ("disabled", True, False),
+        ("overlong", False, False),
+        ("overlong", True, False),
+        ("stop_properly", False, False),
+        ("stop_properly", True, False),
+        ("overlong", True, True),
+    ],
+)
+def test_async_grpo_reward_processing_before_advantages(
+    mock_grpo_components, dynamic_sampling, shaping, scaling
 ):
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 2
@@ -1623,6 +1633,9 @@ def test_async_grpo_reward_shaping_before_advantages(
     master_config.grpo.val_at_end = False
     master_config.grpo.num_generations_per_prompt = 3
     master_config.grpo.use_dynamic_sampling = dynamic_sampling
+    master_config.grpo.reward_scaling = RewardScalingConfig(
+        enabled=scaling, source_min=0.0, source_max=1.0, target_min=-1.0, target_max=1.0
+    )
     master_config.grpo.reward_shaping = RewardShapingConfig(
         enabled=shaping != "disabled",
         overlong_buffer_length=4,
@@ -1662,14 +1675,16 @@ def test_async_grpo_reward_shaping_before_advantages(
             "idx": torch.arange(3),
             "length": torch.full((3,), 3),
             "total_reward": raw_rewards.clone(),
+            "reward/correctness": raw_rewards.clone(),
             "response_token_lengths": torch.tensor(response_lengths),
             "truncated": torch.tensor([False, True, True]),
         }
     )
+    scaled_rewards = 2 * raw_rewards - 1 if scaling else raw_rewards
     expected_rewards = {
-        "disabled": raw_rewards,
-        "overlong": torch.tensor([1.0, -0.5, 0.0]),
-        "stop_properly": torch.tensor([1.0, 0.0, 0.5]),
+        "disabled": scaled_rewards,
+        "overlong": scaled_rewards + torch.tensor([0.0, -0.5, -1.0]),
+        "stop_properly": scaled_rewards * torch.tensor([1.0, 0.5, 0.5]),
     }[shaping]
     estimator = GRPOAdvantageEstimator(
         AdvEstimatorConfig(use_leave_one_out_baseline=False, normalize_rewards=False),
@@ -1707,9 +1722,12 @@ def test_async_grpo_reward_shaping_before_advantages(
     for call in compute.call_args_list:
         torch.testing.assert_close(call.kwargs["rewards"], expected_rewards)
         processed_batch = call.kwargs["repeated_batch"]
+        torch.testing.assert_close(
+            processed_batch["reward/correctness"], scaled_rewards
+        )
         if shaping != "disabled":
             torch.testing.assert_close(
-                processed_batch["unshaped_total_reward"], raw_rewards
+                processed_batch["unshaped_total_reward"], scaled_rewards
             )
         else:
             assert "unshaped_total_reward" not in processed_batch
@@ -1719,9 +1737,9 @@ def test_async_grpo_reward_shaping_before_advantages(
         torch.testing.assert_close(
             advantages, expected_advantages.unsqueeze(-1).expand_as(advantages)
         )
-    # Sampling the same source group twice must not compound penalties or
-    # mutate raw replay rewards (as opposed to the sampled training copy).
+    # Reusing a source group must not compound scaling/shaping or mutate replay.
     torch.testing.assert_close(batch["total_reward"], raw_rewards)
+    torch.testing.assert_close(batch["reward/correctness"], raw_rewards)
     assert "unshaped_total_reward" not in batch
 
 

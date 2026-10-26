@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     _get_effort_config,
+    scale_rewards,
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
@@ -2007,6 +2008,17 @@ class AsyncTrajectoryCollector:
                             raise ValueError(
                                 "Async dynamic sampling requires finite rewards"
                             )
+                        if self.algorithm_config.reward_scaling.enabled:
+                            # Match sync DAPO filtering after scaling/clamping, but
+                            # keep the replay rewards raw for the trainer-side processing.
+                            rewards = scale_rewards(
+                                BatchedDataDict({"total_reward": rewards}),
+                                self.algorithm_config.reward_scaling,
+                            )["total_reward"]
+                            if not torch.isfinite(rewards).all():
+                                raise ValueError(
+                                    "Async dynamic sampling requires finite rewards after scaling"
+                                )
                         # Exact equality matches synchronous DAPO's trivial group
                         retained = not bool(torch.all(rewards == rewards[0]))
                         self._record_dynamic_sampling_metrics(
