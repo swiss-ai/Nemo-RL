@@ -2982,8 +2982,11 @@ class TestAsyncTrajectoryCollector:
 
         assert target_weight not in collector._generating_targets
 
-    def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
-        """Gap-fill sends only the needed prompt groups to one batch worker."""
+    @pytest.mark.parametrize("budget_limited", [False, True])
+    def test_process_batch_gap_fill_spawns_only_needed(
+        self, monkeypatch, budget_limited
+    ):
+        """Gap-fill respects both missing groups and remaining candidate budget."""
 
         class RemoteMethod:
             def __init__(self, value):
@@ -2994,8 +2997,7 @@ class TestAsyncTrajectoryCollector:
 
         class FakeReplayBuffer:
             def __init__(self):
-                # Batch has 2 prompts, but only 1 more trajectory is needed.
-                self.get_trajectories_needed = RemoteMethod(1)
+                self.get_trajectories_needed = RemoteMethod(2 if budget_limited else 1)
 
         started = []
 
@@ -3015,7 +3017,12 @@ class TestAsyncTrajectoryCollector:
                 return False
 
         target_weight = 7
-        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector = self.create_local_collector(
+            replay_buffer=FakeReplayBuffer(), use_dynamic_sampling=budget_limited
+        )
+        if budget_limited:
+            collector.algorithm_config.dynamic_sampling_max_gen_batches = 1
+            collector._dynamic_sampling_candidates[target_weight] = 1
         collector.master_config.grpo.deduplicate_multimodal_data = True
         collector.running = True
 
@@ -3361,7 +3368,7 @@ class TestAsyncTrajectoryCollector:
         if use_dynamic_sampling:
             assert metrics == pytest.approx(
                 {
-                    "dynamic_sampling_num_gen_batches": 0,
+                    "dynamic_sampling_num_gen_batches": 2,
                     "dynamic_sampling_num_discarded_valid_samples": 0,
                     "reward": 4.3000000001 / 12,
                     "filtered_reward": 1.3000000001 / 6,
@@ -3607,6 +3614,8 @@ class TestAsyncTrajectoryCollector:
         assert generations == expected_generations
         assert replay_buffer.add.remote.await_count == 2
         metrics = collector.drain_dynamic_sampling_metrics()
+        assert collector._dynamic_sampling_candidates == {3: 1}
+        assert metrics["dynamic_sampling_num_gen_batches"] == 0.5
         assert metrics["reward"] == pytest.approx(1 / 3)
         assert metrics["filtered_reward"] == pytest.approx(1 / 3)
         assert metrics["dynamic_sampling_num_discarded_valid_samples"] == 0
@@ -3665,6 +3674,133 @@ class TestAsyncTrajectoryCollector:
         assert metrics["reward"] == pytest.approx(1 / 6)
         assert metrics["filtered_reward"] == pytest.approx(1 / 3)
 
+    def test_dynamic_sampling_counts_candidates_not_dispatches(self, monkeypatch):
+        config = self.create_mock_config()
+        config.grpo.num_prompts_per_step = 64
+        monkeypatch.setattr(self, "create_mock_config", lambda: config)
+        replay_buffer = mock.MagicMock()
+        replay_buffer.has_complete_batch.remote = mock.AsyncMock(return_value=False)
+        replay_buffer.get_last_target_weight_already_generated.remote = mock.AsyncMock(
+            return_value=-1
+        )
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, use_dynamic_sampling=True
+        )
+        collector.running = True
+
+        async def groups(**kwargs):
+            for index in range(kwargs["repeated_batch"].size // 3):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=index,
+                    final_batch=BatchedDataDict({"total_reward": torch.zeros(3)}),
+                    rollout_metrics={},
+                )
+
+        monkeypatch.setattr(collector, "_iter_rollout_groups", groups)
+
+        def dispatch(count):
+            asyncio.run(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=self.create_mock_batch(size=count).repeat_interleave(
+                        3
+                    ),
+                    generation_weight_version=2,
+                    target_weight_version=3,
+                    num_generations=3,
+                    use_nemo_gym=False,
+                )
+            )
+
+        # Ten uneven dispatches are only 180 candidates, not ten full batches.
+        for count in [64, 42, 29, 2, 18, 6, 8, 5, 4, 2]:
+            dispatch(count)
+            collector.check_health()
+        assert collector._dynamic_sampling_candidates == {3: 180}
+        assert (
+            collector.drain_dynamic_sampling_metrics()[
+                "dynamic_sampling_num_gen_batches"
+            ]
+            == 180 / 64
+        )
+        # First-stage budget: 10 * 64 candidates. Multiplier support is separate.
+        for _ in range(7):
+            dispatch(64)
+            collector.check_health()
+        assert collector._dynamic_sampling_candidates[3] == 628
+        dispatch(12)
+        with pytest.raises(RuntimeError, match="640/640 candidate prompt groups"):
+            collector.check_health()
+
+    def test_dynamic_sampling_candidate_counts_follow_consumed_targets(
+        self, monkeypatch
+    ):
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_last_target_weight_already_generated.remote.return_value = 3
+        replay_buffer.get_trajectories_needed.remote.return_value = 1
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, use_dynamic_sampling=True
+        )
+        collector._dynamic_sampling_candidates = {3: 99, 4: 3}
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        assert collector._get_next_target_for_generation(3) == 4
+        assert collector._dynamic_sampling_candidates == {4: 3}
+        replay_buffer.get_last_target_weight_already_generated.remote.return_value = 4
+        assert collector._get_next_target_for_generation(3) == 5
+        assert collector._dynamic_sampling_candidates == {}
+
+    def test_dynamic_sampling_replay_ready_before_stream_finishes(self, monkeypatch):
+        buffer = ReplayBufferImpl(max_size=4, drop_incomplete_targets_on_restore=False)
+        replay_buffer = mock.MagicMock()
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, use_dynamic_sampling=True
+        )
+        collector.running = True
+
+        async def run():
+            ready = asyncio.Event()
+            finish_stream = asyncio.Event()
+
+            def add(*args):
+                status = buffer.add(*args)
+                if buffer.has_complete_batch(3, 2, 2):
+                    ready.set()
+                return status
+
+            replay_buffer.add.remote = mock.AsyncMock(side_effect=add)
+
+            async def groups(**kwargs):
+                for index in range(2):
+                    yield trajectory_collector_mod.RolloutGroupResult(
+                        group_index=index,
+                        final_batch=BatchedDataDict(
+                            {"total_reward": torch.tensor([0.0, 1.0, 0.0])}
+                        ),
+                        rollout_metrics={},
+                    )
+                await finish_stream.wait()
+
+            monkeypatch.setattr(collector, "_iter_rollout_groups", groups)
+            worker = asyncio.create_task(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=self.create_mock_batch(size=2).repeat_interleave(3),
+                    generation_weight_version=2,
+                    target_weight_version=3,
+                    num_generations=3,
+                    use_nemo_gym=False,
+                )
+            )
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=10)
+                assert not worker.done()
+                sampled = buffer.sample(2, 3, 2)
+                assert sampled is not None and len(sampled["trajectories"]) == 2
+            finally:
+                finish_stream.set()
+                await asyncio.wait_for(worker, timeout=10)
+            collector.check_health()
+
+        asyncio.run(run())
+
     @pytest.mark.parametrize("all_filtered", [False, True])
     def test_dynamic_sampling_refills_replay_target(self, monkeypatch, all_filtered):
         buffer = ReplayBufferImpl(max_size=8, drop_incomplete_targets_on_restore=False)
@@ -3717,7 +3853,7 @@ class TestAsyncTrajectoryCollector:
             )
             collector.check_health()
             metrics = collector.drain_dynamic_sampling_metrics()
-            assert metrics["dynamic_sampling_num_gen_batches"] == 1
+            assert metrics["dynamic_sampling_num_gen_batches"] == missing / 2
             assert metrics["dynamic_sampling_num_discarded_valid_samples"] == 0
             assert collector._generation_limit_cleared.is_set()
             assert 3 not in collector._generating_targets
@@ -3749,16 +3885,17 @@ class TestAsyncTrajectoryCollector:
         collector.running = True
 
         async def groups(**kwargs):
-            yield trajectory_collector_mod.RolloutGroupResult(
-                group_index=0,
-                final_batch=BatchedDataDict({"total_reward": torch.zeros(3)}),
-                rollout_metrics={},
-            )
+            for index in range(2):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=index,
+                    final_batch=BatchedDataDict({"total_reward": torch.zeros(3)}),
+                    rollout_metrics={},
+                )
 
         monkeypatch.setattr(collector, "_iter_rollout_groups", groups)
         asyncio.run(
             collector._run_rollout_batch_worker(
-                repeated_batch=self.create_mock_batch(size=1).repeat_interleave(3),
+                repeated_batch=self.create_mock_batch(size=2).repeat_interleave(3),
                 generation_weight_version=2,
                 target_weight_version=3,
                 num_generations=3,

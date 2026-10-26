@@ -204,7 +204,7 @@ class AsyncTrajectoryCollector:
             isinstance(master_config, GRPOMasterConfig)
             and master_config.grpo.use_dynamic_sampling
         )
-        self._dynamic_sampling_rounds: dict[int, int] = {}
+        self._dynamic_sampling_candidates: dict[int, int] = {}
         self._dynamic_sampling_metrics: dict[str, int | float] = {}
         self._dynamic_sampling_metrics_lock = _threading.Lock()
         if self._use_dynamic_sampling:
@@ -352,6 +352,24 @@ class AsyncTrajectoryCollector:
 
         return [generation_weight_version + i for i in range(1, generation_lead + 1)]
 
+    @property
+    def _dynamic_sampling_candidate_budget(self) -> int:
+        return (
+            self._num_prompts_per_step
+            * self.algorithm_config.dynamic_sampling_max_gen_batches
+        )
+
+    def _fail_dynamic_sampling_budget(self, target: int, candidates: int) -> None:
+        with self._failure_lock:
+            if self._fatal_error_message is None:
+                self._fatal_error_message = (
+                    "Async dynamic sampling reached dynamic_sampling_max_gen_batches="
+                    f"{self.algorithm_config.dynamic_sampling_max_gen_batches} "
+                    f"({candidates}/{self._dynamic_sampling_candidate_budget} candidate prompt groups) "
+                    f"without filling target {target}. "
+                    "Increase the limit or use prompts with more diverse rewards."
+                )
+
     def _get_next_target_for_generation(
         self, generation_weight_version: int
     ) -> Optional[int]:
@@ -364,10 +382,10 @@ class AsyncTrajectoryCollector:
         )
 
         with self._generation_check_lock:
-            # Remove counters for all ready consumed targets
-            self._dynamic_sampling_rounds = {
-                target: rounds
-                for target, rounds in self._dynamic_sampling_rounds.items()
+            # Remove counters for already consumed targets.
+            self._dynamic_sampling_candidates = {
+                target: candidates
+                for target, candidates in self._dynamic_sampling_candidates.items()
                 if target > last_consumed_target
             }
             for target_weight in target_weights:
@@ -899,6 +917,27 @@ class AsyncTrajectoryCollector:
                 self._release_target(reserved_target)
                 return batch
 
+            if self._use_dynamic_sampling:
+                with self._generation_check_lock:
+                    candidates = self._dynamic_sampling_candidates.get(
+                        reserved_target, 0
+                    )
+                remaining_budget = self._dynamic_sampling_candidate_budget - candidates
+                if remaining_budget <= 0:
+                    # Training may have consumed this target since we reserved
+                    # it. Fail only if it is still pending and has no budget anymore.
+                    last_consumed = ray.get(
+                        self.replay_buffer.get_last_target_weight_already_generated.remote()
+                    )
+                    if reserved_target > last_consumed:
+                        self._fail_dynamic_sampling_budget(reserved_target, candidates)
+
+                    # Release the target and keep this input batch unused.
+                    self._release_target(reserved_target)
+                    return batch
+
+                num_prompts_to_generate = min(num_prompts_to_generate, remaining_budget)
+
             if num_prompts_to_generate < num_prompts_in_batch:
                 # Keep the unused suffix instead of discarding it: the caller
                 # re-queues it ahead of the next dataloader pull.
@@ -1370,9 +1409,11 @@ class AsyncTrajectoryCollector:
         """Return and reset collection-interval DAPO metrics atomically.
 
         Names mirror synchronous DAPO, but intervals overlap training and do not
-        describe its sampled batch. Generation batches count worker starts, not
-        internal stream retries. Rewards are those used for filtering. Completed
-        groups skipped on recovery are not counted again; fresh generations are.
+        describe its sampled batch. Generation batches count evaluated candidates
+        divided by the training prompt count, including fractional batches, not
+        dispatches or internal stream retries. Reward means use the filtering
+        rewards and include regenerated results; candidate counts charge each
+        prompt only once within a worker.
         """
         with self._dynamic_sampling_metrics_lock:
             stats = self._dynamic_sampling_metrics
@@ -1671,17 +1712,6 @@ class AsyncTrajectoryCollector:
         worker_start = time.perf_counter()
         wake_generation_limits_after_cleanup = self._use_dynamic_sampling
         try:
-            if self._use_dynamic_sampling:
-                # Update number of generation batches attempted for this training target
-                with self._generation_check_lock:
-                    rounds = (
-                        self._dynamic_sampling_rounds.get(target_weight_version, 0) + 1
-                    )
-                    self._dynamic_sampling_rounds[target_weight_version] = rounds
-                with self._dynamic_sampling_metrics_lock:
-                    stats = self._dynamic_sampling_metrics
-                    key = "dynamic_sampling_num_gen_batches"
-                    stats[key] = stats.get(key, 0) + 1
             await self._collect_rollout_batch(
                 repeated_batch=repeated_batch,
                 generation_weight_version=generation_weight_version,
@@ -1689,9 +1719,14 @@ class AsyncTrajectoryCollector:
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
             )
+            if self._use_dynamic_sampling:
+                with self._generation_check_lock:
+                    candidates = self._dynamic_sampling_candidates.get(
+                        target_weight_version, 0
+                    )
             if (
                 self._use_dynamic_sampling
-                and rounds >= self.algorithm_config.dynamic_sampling_max_gen_batches
+                and candidates >= self._dynamic_sampling_candidate_budget
             ):
                 # Check if replay buffer is full
                 complete = await self.replay_buffer.has_complete_batch.remote(
@@ -1701,13 +1736,9 @@ class AsyncTrajectoryCollector:
                 )
                 last_consumed = await self.replay_buffer.get_last_target_weight_already_generated.remote()
                 if not complete and last_consumed < target_weight_version:
-                    with self._failure_lock:
-                        self._fatal_error_message = (
-                            "Async dynamic sampling reached dynamic_sampling_max_gen_batches="
-                            f"{self.algorithm_config.dynamic_sampling_max_gen_batches} "
-                            f"without filling target {target_weight_version}. "
-                            "Increase the limit or use prompts with more diverse rewards."
-                        )
+                    self._fail_dynamic_sampling_budget(
+                        target_weight_version, candidates
+                    )
             with self._failure_lock:
                 if self._fatal_error_message is None:
                     self._failure_count = 0
@@ -1960,6 +1991,7 @@ class AsyncTrajectoryCollector:
         # Completed includes deliberately discarded groups: stream retries must
         # not regenerate them. Only retained groups count toward replay readiness.
         completed_group_indices: set[int] = set()
+        counted_candidate_indices: set[int] = set()
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
@@ -2019,6 +2051,22 @@ class AsyncTrajectoryCollector:
                                 raise ValueError(
                                     "Async dynamic sampling requires finite rewards after scaling"
                                 )
+                        if group_index not in counted_candidate_indices:
+                            # Charge a candidate only once it has valid rewards.
+                            # Retrying that prompt within this worker is not a
+                            # new candidate; backend errors keep their own limit.
+                            with self._generation_check_lock:
+                                candidates = self._dynamic_sampling_candidates
+                                candidates[target_weight_version] = (
+                                    candidates.get(target_weight_version, 0) + 1
+                                )
+                            with self._dynamic_sampling_metrics_lock:
+                                stats = self._dynamic_sampling_metrics
+                                key = "dynamic_sampling_num_gen_batches"
+                                stats[key] = (
+                                    stats.get(key, 0) + 1 / self._num_prompts_per_step
+                                )
+                            counted_candidate_indices.add(group_index)
                         # Exact equality matches synchronous DAPO's trivial group
                         retained = not bool(torch.all(rewards == rewards[0]))
                         self._record_dynamic_sampling_metrics(

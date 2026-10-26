@@ -46,11 +46,12 @@ buffer accumulates retained groups, and the collector generates new prompts to
 fill each target training batch's remaining slots. Discarded groups are not
 retried as failed rollouts.
 
-`dynamic_sampling_max_gen_batches` limits generation rounds per target batch,
-including gap-fill rounds; an incomplete target at the limit fails the collector
-health check. This counter restarts on checkpoint resume. Unlike synchronous
-oversampling, each async dispatch generates at most the target's missing prompt
-count; larger dataloader batches are carried over rather than discarded.
+`dynamic_sampling_max_gen_batches` limits candidates per target to
+`dynamic_sampling_max_gen_batches × num_prompts_per_step`. Each candidate group
+with valid rewards counts once, whether retained or discarded. `batch_multiplier`
+does not change this limit. Training starts as soon as enough useful groups are
+ready. An incomplete target at the limit stops collection with an error. Counters
+reset after target consumption and on checkpoint resume.
 
 Optional reward scaling and shaping run after replay sampling, in the same order
 as sync GRPO: `scale_rewards`, then `apply_reward_shaping`, then advantage computation.
@@ -70,8 +71,9 @@ otherwise equal-reward group pass filtering.
 Dynamic sampling is still unsupported by the single-controller path.
 
 The collector uses the sync DAPO metric names under `collection/dynamic_sampling/`:
-- `dynamic_sampling_num_gen_batches`: generation batch workers started in the interval,
-  excluding internal stream retries (unlike sync's per-training-batch round count).
+- `dynamic_sampling_num_gen_batches`: candidates evaluated in the interval divided
+  by `num_prompts_per_step`, including fractional batches. Internal stream retries
+  do not consume another candidate batch.
 - `dynamic_sampling_num_discarded_valid_samples`: always zero, since async gap filling
   does not overfill a target and discard excess useful samples.
 - `reward` and `filtered_reward`: sample-weighted mean rewards before and after
@@ -79,9 +81,8 @@ The collector uses the sync DAPO metric names under `collection/dynamic_sampling
 
 These are drain-to-drain **collection intervals**, not metrics for the trainer's
 sampled batch. Passing filtering does not guarantee a group has been buffered or
-trained yet. Completed groups skipped during stream recovery are not counted again;
-fresh generations are. Empty intervals emit no metrics, and reward means with no
-samples are omitted. Counters reset after draining and on checkpoint resume.
+trained yet. Empty intervals emit no metrics, and reward means with no samples are
+omitted. Counters reset after draining and on checkpoint resume.
 Equal-reward discards are also printed in collector logs.
 
 ### About batch_multiplier
