@@ -5242,6 +5242,14 @@ def async_grpo_train(
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
+                # The collector has already filtered groups using raw rewards
+                # when dynamic sampling is enabled. We now shape the sampled batch
+                # so advantages use the penalized rewards, as in sync GRPO.
+                if master_config.grpo.reward_shaping.enabled:
+                    repeated_batch = apply_reward_shaping(
+                        repeated_batch, master_config.grpo.reward_shaping
+                    )
+
                 # Baseline spec-decode counters; the delta read at metrics time gives
                 # MTP acceptance over this step's generation window (async generation
                 # runs continuously in the background collector).

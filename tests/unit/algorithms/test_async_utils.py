@@ -3311,12 +3311,19 @@ class TestAsyncTrajectoryCollector:
             replay_buffer=replay_buffer, use_dynamic_sampling=use_dynamic_sampling
         )
         collector.running = True
+        # Shaping belongs to the trainer. Truncation-dependent penalties must
+        # not make the collector retain a group with identical raw rewards.
+        collector.master_config.grpo.reward_shaping.enabled = True
+        collector.master_config.grpo.reward_shaping.stop_properly_penalty_coef = 0.5
         batch = self.create_mock_batch(size=4)
         collector._stamp_task_indices(batch)
         collector._outstanding_task_indices.update(range(4))
         batches = [
             BatchedDataDict(
-                {"total_reward": torch.tensor(rewards, dtype=torch.float64)}
+                {
+                    "total_reward": torch.tensor(rewards, dtype=torch.float64),
+                    "truncated": torch.tensor([False, True, True]),
+                }
             )
             for rewards in ([1, 1, 1], [0, 0, 0], [0, 1, 0], [0.1, 0.1, 0.1000000001])
         ]

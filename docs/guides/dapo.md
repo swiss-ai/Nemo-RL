@@ -51,8 +51,16 @@ health check. This counter restarts on checkpoint resume. Unlike synchronous
 oversampling, each async dispatch generates at most the target's missing prompt
 count; larger dataloader batches are carried over rather than discarded.
 
-Reward scaling and reward shaping remain unsupported in this async path. Dynamic
-sampling is still unsupported by the single-controller path.
+Optional reward shaping is applied by the async trainer after replay sampling,
+using the same `apply_reward_shaping` implementation as sync GRPO. Enable it with
+`grpo.reward_shaping.enabled: true` and configure the overlong penalty (or
+`stop_properly_penalty_coef`). Dynamic sampling and collector reward metrics use
+original rewards; advantages and training reward logs use shaped rewards. Thus
+length penalties cannot make an otherwise equal-reward group pass filtering, and
+replayed groups are not penalized twice.
+
+Reward scaling remains unsupported in this async path. Dynamic sampling is still
+unsupported by the single-controller path.
 
 The collector uses the sync DAPO metric names under `collection/dynamic_sampling/`:
 - `dynamic_sampling_num_gen_batches`: generation batch workers started in the interval,
