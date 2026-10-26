@@ -199,6 +199,18 @@ class AsyncTrajectoryCollector:
             )
         self.algorithm_config = algorithm_config
         self.async_config = async_config
+        self._use_dynamic_sampling = (
+            isinstance(master_config, GRPOMasterConfig)
+            and master_config.grpo.use_dynamic_sampling
+        )
+        self._dynamic_sampling_rounds: dict[int, int] = {}
+        if self._use_dynamic_sampling:
+            if algorithm_config.num_generations_per_prompt < 2:
+                raise ValueError(
+                    "Async dynamic sampling requires at least two generations per prompt"
+                )
+            if algorithm_config.dynamic_sampling_max_gen_batches <= 0:
+                raise ValueError("dynamic_sampling_max_gen_batches must be positive")
         self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
         self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
         self._max_rollout_turns = algorithm_config.max_rollout_turns
@@ -349,6 +361,12 @@ class AsyncTrajectoryCollector:
         )
 
         with self._generation_check_lock:
+            # Remove counters for all ready consumed targets
+            self._dynamic_sampling_rounds = {
+                target: rounds
+                for target, rounds in self._dynamic_sampling_rounds.items()
+                if target > last_consumed_target
+            }
             for target_weight in target_weights:
                 if target_weight <= last_consumed_target:
                     continue
@@ -534,6 +552,10 @@ class AsyncTrajectoryCollector:
                 # Check if generation limits require pausing collection
                 if self._should_pause_for_generation_limits() and self.running:
                     self._generation_limit_cleared.clear()
+                    # A worker may have released an incomplete target between
+                    # the first check and clear(). Do not lose its refill wake-up.
+                    if not self._should_pause_for_generation_limits():
+                        self._generation_limit_cleared.set()
 
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
@@ -1597,8 +1619,15 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Own one target reservation while collecting its rollout batch."""
         worker_start = time.perf_counter()
-        wake_generation_limits_after_cleanup = False
+        wake_generation_limits_after_cleanup = self._use_dynamic_sampling
         try:
+            if self._use_dynamic_sampling:
+                # Update number of generation batches attempted for this training target
+                with self._generation_check_lock:
+                    rounds = (
+                        self._dynamic_sampling_rounds.get(target_weight_version, 0) + 1
+                    )
+                    self._dynamic_sampling_rounds[target_weight_version] = rounds
             await self._collect_rollout_batch(
                 repeated_batch=repeated_batch,
                 generation_weight_version=generation_weight_version,
@@ -1606,6 +1635,25 @@ class AsyncTrajectoryCollector:
                 num_generations=num_generations,
                 use_nemo_gym=use_nemo_gym,
             )
+            if (
+                self._use_dynamic_sampling
+                and rounds >= self.algorithm_config.dynamic_sampling_max_gen_batches
+            ):
+                # Check if replay buffer is full
+                complete = await self.replay_buffer.has_complete_batch.remote(
+                    target_weight_version,
+                    self._num_prompts_per_step,
+                    self._max_trajectory_age_steps,
+                )
+                last_consumed = await self.replay_buffer.get_last_target_weight_already_generated.remote()
+                if not complete and last_consumed < target_weight_version:
+                    with self._failure_lock:
+                        self._fatal_error_message = (
+                            "Async dynamic sampling reached dynamic_sampling_max_gen_batches="
+                            f"{self.algorithm_config.dynamic_sampling_max_gen_batches} "
+                            f"without filling target {target_weight_version}. "
+                            "Increase the limit or use prompts with more diverse rewards."
+                        )
             with self._failure_lock:
                 if self._fatal_error_message is None:
                     self._failure_count = 0
@@ -1701,11 +1749,11 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: int,
         expected_prompt_groups: int,
-        buffered_group_indices: set[int],
+        completed_group_indices: set[int],
         collection_started_at: float,
         input_task_index: Optional[int] = None,
     ) -> None:
-        """Push one prompt group to the replay buffer with bounded backoff."""
+        """Push one retained prompt group to replay with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
         rollout_metrics = rollout_result.rollout_metrics
 
@@ -1780,7 +1828,7 @@ class AsyncTrajectoryCollector:
                     target_weight_version,
                 )
                 if status == "success":
-                    buffered_group_indices.add(rollout_result.group_index)
+                    completed_group_indices.add(rollout_result.group_index)
                     if group_task_index is not None:
                         # The cut now covers this ordinal via the buffer's
                         # held-ordinal report instead of the outstanding set.
@@ -1796,7 +1844,7 @@ class AsyncTrajectoryCollector:
                     print(
                         "📦 Buffered prompt group "
                         f"({group_description}, target_weight={target_weight_version}) "
-                        f"[{len(buffered_group_indices)}/{expected_prompt_groups} buffered]"
+                        f"[{len(completed_group_indices)}/{expected_prompt_groups} processed]"
                     )
                     return
                 if status != "full":
@@ -1855,11 +1903,13 @@ class AsyncTrajectoryCollector:
             )
             for group_index in range(expected_prompt_groups)
         ]
-        buffered_group_indices: set[int] = set()
+        # Completed includes deliberately discarded groups: stream retries must
+        # not regenerate them. Only retained groups count toward replay readiness.
+        completed_group_indices: set[int] = set()
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
         for attempt in range(1, max_attempts + 1):
-            pending_before_attempt = expected_group_indices - buffered_group_indices
+            pending_before_attempt = expected_group_indices - completed_group_indices
             if use_nemo_gym and pending_before_attempt != expected_group_indices:
                 row_indices = [
                     group_index * num_generations + offset
@@ -1888,13 +1938,31 @@ class AsyncTrajectoryCollector:
                             f"{rollout_result.final_batch.size} rollouts; expected "
                             f"{num_generations}"
                         )
-                    if group_index in buffered_group_indices:
+                    if group_index in completed_group_indices:
                         continue
                     if group_index in scheduled_group_indices:
                         raise ValueError(
                             f"Rollout stream yielded prompt group {group_index} twice"
                         )
                     scheduled_group_indices.add(group_index)
+                    if self._use_dynamic_sampling:
+                        rewards = rollout_result.final_batch.get(
+                            "unshaped_total_reward",
+                            rollout_result.final_batch["total_reward"],
+                        )
+                        if not torch.isfinite(rewards).all():
+                            raise ValueError(
+                                "Async dynamic sampling requires finite rewards"
+                            )
+                        # Exact equality matches synchronous DAPO's trivial group
+                        if torch.all(rewards == rewards[0]):
+                            completed_group_indices.add(group_index)
+                            task_index = group_input_task_indices[group_index]
+                            if task_index is not None:
+                                with self._outstanding_lock:
+                                    self._outstanding_task_indices.discard(task_index)
+                            # Discard group from replay buffer.
+                            continue
                     push_tasks.append(
                         asyncio.create_task(
                             self._enqueue_rollout_group(
@@ -1902,7 +1970,7 @@ class AsyncTrajectoryCollector:
                                 generation_weight_version=generation_weight_version,
                                 target_weight_version=target_weight_version,
                                 expected_prompt_groups=expected_prompt_groups,
-                                buffered_group_indices=buffered_group_indices,
+                                completed_group_indices=completed_group_indices,
                                 collection_started_at=collection_started_at,
                                 input_task_index=group_input_task_indices[group_index],
                             )
@@ -1915,7 +1983,7 @@ class AsyncTrajectoryCollector:
             push_errors = [
                 result for result in push_results if isinstance(result, Exception)
             ]
-            pending_group_indices = expected_group_indices - buffered_group_indices
+            pending_group_indices = expected_group_indices - completed_group_indices
             if not pending_group_indices:
                 return
 
@@ -1941,7 +2009,7 @@ class AsyncTrajectoryCollector:
 
         batch_error = RuntimeError(
             "Rollout batch failed to buffer prompt groups "
-            f"{sorted(expected_group_indices - buffered_group_indices)}"
+            f"{sorted(expected_group_indices - completed_group_indices)}"
         )
         if last_error is not None:
             raise batch_error from last_error

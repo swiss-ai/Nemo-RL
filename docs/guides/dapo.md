@@ -35,6 +35,25 @@ Standard GRPO trains on all generated responses, even when they have identical r
 6. Samples are accumulated until the maximum number of allowed batches (`dynamic_sampling_max_gen_batches`) is reached. If the cache still does not meet the target rollout batch size at that point, an error is raised. To resolve this, consider adjusting parameters such as `num_prompts_per_step` or `num_generations_per_prompt` to increase sample diversity, or revisit the complexity of your data.
 7. Perform training on the collected samples with nonzero standard deviation
 
+### Async GRPO
+
+Dynamic sampling is also supported by the legacy async GRPO loop
+(`grpo.async_grpo.enabled: true`). Set `grpo.use_dynamic_sampling: true`
+and use at least two generations per prompt. The trajectory collector discards
+completed prompt groups with identical rewards before replay insertion. The replay
+buffer accumulates retained groups, and the collector generates new prompts to
+fill each target training batch's remaining slots. Discarded groups are not
+retried as failed rollouts.
+
+`dynamic_sampling_max_gen_batches` limits generation rounds per target batch,
+including gap-fill rounds; an incomplete target at the limit fails the collector
+health check. This counter restarts on checkpoint resume. Unlike synchronous
+oversampling, each async dispatch generates at most the target's missing prompt
+count; larger dataloader batches are carried over rather than discarded.
+
+Reward scaling and reward shaping remain unsupported in this async path. Dynamic
+sampling is still unsupported by the single-controller path.
+
 ### About batch_multiplier
 
 `batch_multiplier` (a float ≥ 1.0) controls the initial prompt pool size by sampling `batch_multiplier × num_prompts_per_step` prompts before dynamic sampling. Higher values increase memory and compute requirements, while very low values (e.g., 1.0) may slow the cache accumulation of prompt groups with nonzero standard deviation. The optimal value depends on the dataset, model capacity, and overall training setup.  When **dynamic sampling** is enabled, we also log two additional metrics:
