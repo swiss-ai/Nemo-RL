@@ -1297,6 +1297,13 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
+    def drain_dynamic_sampling_metrics(self):
+        """Return an empty collection interval by default."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
     def get_dataloader_state(self):
         """Return a remote-callable mock yielding a checkpointable dataloader state.
 
@@ -1544,6 +1551,196 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+@pytest.mark.parametrize(
+    "enabled,has_metrics", [(False, True), (True, False), (True, True)]
+)
+def test_async_grpo_logs_dynamic_sampling_collection_interval(
+    mock_grpo_components, enabled, has_metrics
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = enabled
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = False
+    collection_metrics = (
+        {
+            "dynamic_sampling_num_gen_batches": 2,
+            "dynamic_sampling_num_discarded_valid_samples": 0,
+            "reward": 0.5,
+            "filtered_reward": 0.75,
+        }
+        if has_metrics
+        else {}
+    )
+    drain = MagicMock()
+    drain.remote.return_value = collection_metrics
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {"mean_gen_tokens_per_sample": 2.0}),
+        patch.object(
+            StubAsyncTrajectoryCollector, "drain_dynamic_sampling_metrics", drain
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+    assert drain.remote.call_count == int(enabled)
+    logged = [
+        call
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "collection/dynamic_sampling"
+    ]
+    assert len(logged) == int(enabled and has_metrics)
+    if logged:
+        assert logged[0].args == (collection_metrics, 1)
+
+
+@pytest.mark.parametrize(
+    "shaping,dynamic_sampling,scaling",
+    [
+        ("disabled", False, False),
+        ("disabled", True, False),
+        ("overlong", False, False),
+        ("overlong", True, False),
+        ("stop_properly", False, False),
+        ("stop_properly", True, False),
+        ("overlong", True, True),
+    ],
+)
+def test_async_grpo_reward_processing_before_advantages(
+    mock_grpo_components, dynamic_sampling, shaping, scaling
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.use_dynamic_sampling = dynamic_sampling
+    master_config.grpo.reward_scaling = RewardScalingConfig(
+        enabled=scaling, source_min=0.0, source_max=1.0, target_min=-1.0, target_max=1.0
+    )
+    master_config.grpo.reward_shaping = RewardShapingConfig(
+        enabled=shaping != "disabled",
+        overlong_buffer_length=4,
+        overlong_buffer_penalty=1.0,
+        max_response_length=6,
+    )
+    if shaping == "stop_properly":
+        master_config.grpo.reward_shaping = RewardShapingConfig(
+            enabled=True, stop_properly_penalty_coef=0.5
+        )
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.policy["train_global_batch_size"] = 3
+    master_config.checkpointing["enabled"] = False
+    response_lengths = [2, 4, 6]
+    raw_rewards = torch.tensor([1.0, 0.0, 1.0])
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "response",
+                        "token_ids": torch.full((length,), 4),
+                        "generation_logprobs": torch.zeros(length),
+                    },
+                ]
+                for length in response_lengths
+            ],
+            "task_name": ["math"] * 3,
+            "extra_env_info": [{} for _ in range(3)],
+            "loss_multiplier": torch.ones(3),
+            "idx": torch.arange(3),
+            "length": torch.full((3,), 3),
+            "total_reward": raw_rewards.clone(),
+            "reward/correctness": raw_rewards.clone(),
+            "response_token_lengths": torch.tensor(response_lengths),
+            "truncated": torch.tensor([False, True, True]),
+        }
+    )
+    scaled_rewards = 2 * raw_rewards - 1 if scaling else raw_rewards
+    expected_rewards = {
+        "disabled": scaled_rewards,
+        "overlong": scaled_rewards + torch.tensor([0.0, -0.5, -1.0]),
+        "stop_properly": scaled_rewards * torch.tensor([1.0, 0.5, 0.5]),
+    }[shaping]
+    estimator = GRPOAdvantageEstimator(
+        AdvEstimatorConfig(use_leave_one_out_baseline=False, normalize_rewards=False),
+        ClippedPGLossConfig(),
+    )
+    policy = mock_grpo_components["policy"]
+    policy.get_logprobs.side_effect = lambda data, **kwargs: {
+        "logprobs": torch.zeros_like(data["input_ids"], dtype=torch.float32)
+    }
+    with (
+        mock_async_grpo_infrastructure(batch, {"mean_gen_tokens_per_sample": 4.0}),
+        patch(
+            "nemo_rl.algorithms.grpo._create_advantage_estimator",
+            return_value=estimator,
+        ),
+        patch.object(
+            estimator, "compute_advantage", wraps=estimator.compute_advantage
+        ) as compute,
+    ):
+        async_grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+    assert compute.call_count == policy.train.call_count == 2
+    for call in compute.call_args_list:
+        torch.testing.assert_close(call.kwargs["rewards"], expected_rewards)
+        processed_batch = call.kwargs["repeated_batch"]
+        torch.testing.assert_close(
+            processed_batch["reward/correctness"], scaled_rewards
+        )
+        if shaping != "disabled":
+            torch.testing.assert_close(
+                processed_batch["unshaped_total_reward"], scaled_rewards
+            )
+        else:
+            assert "unshaped_total_reward" not in processed_batch
+    expected_advantages = expected_rewards - expected_rewards.mean()
+    for call in policy.train.call_args_list:
+        advantages = call.args[0]["advantages"]
+        torch.testing.assert_close(
+            advantages, expected_advantages.unsqueeze(-1).expand_as(advantages)
+        )
+    # Reusing a source group must not compound scaling/shaping or mutate replay.
+    torch.testing.assert_close(batch["total_reward"], raw_rewards)
+    torch.testing.assert_close(batch["reward/correctness"], raw_rewards)
+    assert "unshaped_total_reward" not in batch
 
 
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):

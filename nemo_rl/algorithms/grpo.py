@@ -4485,13 +4485,11 @@ def _startup_pipeline_ready(
 ) -> bool:
     """Return whether async training can overlap safely with lookahead generation.
 
-    A restored buffer may already contain ``step``, letting startup consume it
-    before the collector generates ``step + 1``. After the refit that follows
-    ``step``, the collector's target window advances to ``step + 2``, so an
-    unclaimed ``step + 1`` would then be permanently missing. Requiring the
-    next target to be complete *or* actively claimed keeps that gap closed
-    while preserving the training/generation overlap used by steady-state async
-    training, and without letting an unrelated reservation open the barrier.
+    Require the current batch to be ready and the next target to be complete
+    or actively claimed. This starts training with lookahead work in the
+    pipeline, including after checkpoint restore. An unrelated reservation
+    must not open the barrier. Incomplete current targets remain eligible for
+    collection after subsequent weight updates.
     """
     if not current_step_ready:
         return False
@@ -5241,6 +5239,17 @@ def async_grpo_train(
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
+
+                # The collector has already filtered groups using scaled,
+                # unshaped rewards when dynamic sampling is enabled. Process the
+                # sampled copy in sync GRPO order: scaling, then shaping.
+                repeated_batch = scale_rewards(
+                    repeated_batch, master_config.grpo.reward_scaling
+                )
+                if master_config.grpo.reward_shaping.enabled:
+                    repeated_batch = apply_reward_shaping(
+                        repeated_batch, master_config.grpo.reward_shaping
+                    )
 
                 # Baseline spec-decode counters; the delta read at metrics time gives
                 # MTP acceptance over this step's generation window (async generation
@@ -6030,6 +6039,17 @@ def async_grpo_train(
                 )
             if payload_metrics:
                 logger.log_metrics(payload_metrics, step + 1, prefix="")
+
+            if master_config.grpo.use_dynamic_sampling:
+                collection_metrics = ray.get(
+                    trajectory_collector.drain_dynamic_sampling_metrics.remote()
+                )
+                if collection_metrics:
+                    logger.log_metrics(
+                        collection_metrics,
+                        step + 1,
+                        prefix="collection/dynamic_sampling",
+                    )
 
             if refit_metrics:
                 logger.log_metrics(refit_metrics, step + 1, prefix="refit")

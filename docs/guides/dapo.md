@@ -35,6 +35,62 @@ Standard GRPO trains on all generated responses, even when they have identical r
 6. Samples are accumulated until the maximum number of allowed batches (`dynamic_sampling_max_gen_batches`) is reached. If the cache still does not meet the target rollout batch size at that point, an error is raised. To resolve this, consider adjusting parameters such as `num_prompts_per_step` or `num_generations_per_prompt` to increase sample diversity, or revisit the complexity of your data.
 7. Perform training on the collected samples with nonzero standard deviation
 
+### Async GRPO
+
+Dynamic sampling is also supported by the legacy async GRPO loop
+(`grpo.async_grpo.enabled: true`). Set `grpo.use_dynamic_sampling: true`
+and use at least two generations per prompt. The trajectory collector discards
+completed prompt groups with identical unshaped rewards (after optional scaling)
+before replay insertion. Each candidate dispatch requests
+`int(num_prompts_per_step × batch_multiplier)` prompts, including refills, subject
+to the remaining candidate budget and available dataset rows. Groups enter replay
+as they finish; the collector does not shrink a candidate batch to the number of
+missing useful groups. Each target admits at most `num_prompts_per_step` groups.
+Useful surplus is discarded rather than carried to another target or blocked on
+replay capacity. Discarded groups are not retried as failed rollouts. Incomplete
+current targets remain eligible after weight updates.
+
+`dynamic_sampling_max_gen_batches` limits candidates per target to
+`dynamic_sampling_max_gen_batches × int(num_prompts_per_step × batch_multiplier)`.
+Each candidate group with valid rewards counts once against its dispatch target,
+whether retained or discarded.
+Training starts as soon as enough useful groups are ready; it does not wait for a
+full candidate batch. An incomplete target at the limit stops collection with an
+error. Counters reset after target consumption and on checkpoint resume.
+
+Optional reward scaling and shaping run after replay sampling, in the same order
+as sync GRPO: `scale_rewards`, then `apply_reward_shaping`, then advantage computation.
+Enable scaling with `grpo.reward_scaling.enabled: true` and set the source and target
+ranges. Scaling clamps rewards to the source range before mapping them to the target
+range. It also processes named GDPO reward components. Enable shaping separately
+with `grpo.reward_shaping.enabled: true` and configure the overlong penalty (or
+`stop_properly_penalty_coef`).
+
+For dynamic sampling, the collector scales a reward copy before testing equality.
+This also rejects groups whose rewards become equal after clamping, as in sync GRPO.
+The replay buffer keeps original rewards, so the trainer does not scale them twice.
+Collector reward metrics use scaled, unshaped rewards; advantages and training reward
+logs use rewards after scaling and shaping. Length penalties cannot make an
+otherwise equal-reward group pass filtering.
+
+Dynamic sampling is still unsupported by the single-controller path.
+
+The collector uses the sync DAPO metric names under `collection/dynamic_sampling/`:
+- `dynamic_sampling_num_gen_batches`: candidates evaluated in the interval divided
+  by `int(num_prompts_per_step × batch_multiplier)`, including fractional batches.
+  Internal stream retries
+  do not consume another candidate batch.
+- `dynamic_sampling_num_discarded_valid_samples`: useful response samples discarded
+  because they exceed the target's remaining useful-group quota.
+- `reward` and `filtered_reward`: sample-weighted mean rewards before and after
+  filtering (after optional scaling, before shaping).
+
+These are drain-to-drain **collection intervals**, not metrics for the trainer's
+sampled batch. Passing filtering does not guarantee a group has been buffered or
+trained yet. Empty intervals emit no metrics, and reward means with no samples are
+omitted. Counters reset after draining and on checkpoint resume.
+Equal-reward discards are also printed in collector logs.
+
 ### About batch_multiplier
 
 `batch_multiplier` (a float ≥ 1.0) controls the initial prompt pool size by sampling `batch_multiplier × num_prompts_per_step` prompts before dynamic sampling. Higher values increase memory and compute requirements, while very low values (e.g., 1.0) may slow the cache accumulation of prompt groups with nonzero standard deviation. The optimal value depends on the dataset, model capacity, and overall training setup.  When **dynamic sampling** is enabled, we also log two additional metrics:
