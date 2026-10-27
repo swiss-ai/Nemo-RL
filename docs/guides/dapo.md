@@ -41,14 +41,19 @@ Dynamic sampling is also supported by the legacy async GRPO loop
 (`grpo.async_grpo.enabled: true`). Set `grpo.use_dynamic_sampling: true`
 and use at least two generations per prompt. The trajectory collector discards
 completed prompt groups with identical unshaped rewards (after optional scaling)
-before replay insertion. The replay
-buffer accumulates retained groups, and the collector generates new prompts to
-fill each target training batch's remaining slots. Discarded groups are not
-retried as failed rollouts.
+before replay insertion. Each candidate dispatch requests
+`int(num_prompts_per_step × batch_multiplier)` prompts, including refills, subject
+to the remaining candidate budget and available dataset rows. Groups enter replay
+as they finish; the collector does not shrink a candidate batch to the number of
+missing useful groups. Each target admits at most `num_prompts_per_step` groups.
+Useful surplus is discarded rather than carried to another target or blocked on
+replay capacity. Discarded groups are not retried as failed rollouts. Incomplete
+current targets remain eligible after weight updates.
 
 `dynamic_sampling_max_gen_batches` limits candidates per target to
 `dynamic_sampling_max_gen_batches × int(num_prompts_per_step × batch_multiplier)`.
-Each candidate group with valid rewards counts once, whether retained or discarded.
+Each candidate group with valid rewards counts once against its dispatch target,
+whether retained or discarded.
 Training starts as soon as enough useful groups are ready; it does not wait for a
 full candidate batch. An incomplete target at the limit stops collection with an
 error. Counters reset after target consumption and on checkpoint resume.
@@ -75,8 +80,8 @@ The collector uses the sync DAPO metric names under `collection/dynamic_sampling
   by `int(num_prompts_per_step × batch_multiplier)`, including fractional batches.
   Internal stream retries
   do not consume another candidate batch.
-- `dynamic_sampling_num_discarded_valid_samples`: always zero, since async gap filling
-  does not overfill a target and discard excess useful samples.
+- `dynamic_sampling_num_discarded_valid_samples`: useful response samples discarded
+  because they exceed the target's remaining useful-group quota.
 - `reward` and `filtered_reward`: sample-weighted mean rewards before and after
   filtering (after optional scaling, before shaping).
 

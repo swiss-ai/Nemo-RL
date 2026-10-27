@@ -4485,13 +4485,11 @@ def _startup_pipeline_ready(
 ) -> bool:
     """Return whether async training can overlap safely with lookahead generation.
 
-    A restored buffer may already contain ``step``, letting startup consume it
-    before the collector generates ``step + 1``. After the refit that follows
-    ``step``, the collector's target window advances to ``step + 2``, so an
-    unclaimed ``step + 1`` would then be permanently missing. Requiring the
-    next target to be complete *or* actively claimed keeps that gap closed
-    while preserving the training/generation overlap used by steady-state async
-    training, and without letting an unrelated reservation open the barrier.
+    Require the current batch to be ready and the next target to be complete
+    or actively claimed. This starts training with lookahead work in the
+    pipeline, including after checkpoint restore. An unrelated reservation
+    must not open the barrier. Incomplete current targets remain eligible for
+    collection after subsequent weight updates.
     """
     if not current_step_ready:
         return False
