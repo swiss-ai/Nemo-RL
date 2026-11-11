@@ -790,9 +790,10 @@ class LogprobsPostProcessor:
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-            token_logprobs = mask_out_neg_inf_logprobs(
+            token_logprobs, updated_mask = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
             )
+            data_dict["token_mask"] = updated_mask
 
         return token_logprobs
 

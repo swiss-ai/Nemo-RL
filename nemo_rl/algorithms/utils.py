@@ -277,7 +277,7 @@ def masked_mean(
 
 def mask_out_neg_inf_logprobs(
     logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask out negative infinity log probabilities.
 
     Handling sampling mask mismatch:
@@ -292,7 +292,7 @@ def mask_out_neg_inf_logprobs(
         logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
-        Masked log probabilities.
+        The masked log probabilities and the updated token mask.
     """
     is_neginf = torch.isinf(logprobs)
     neginf_count = (is_neginf & mask.bool()).sum().item()
@@ -305,7 +305,7 @@ def mask_out_neg_inf_logprobs(
     mask = mask * (~is_neginf).float()
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
-    return logprobs
+    return logprobs, mask
 
 
 def masked_var(

@@ -272,7 +272,10 @@ def prepare_loss_input(
             # mask out negative infinity logprobs
             # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            logprobs, updated_mask = mask_out_neg_inf_logprobs(
+                logprobs, mask[:, 1:], "curr_logprobs"
+            )
+            data["token_mask"][:, 1:] = updated_mask
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -544,7 +547,10 @@ def prepare_packed_loss_input(
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
     if need_top_k_or_top_p_filtering(sampling_params):
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+        logprobs, updated_mask = mask_out_neg_inf_logprobs(
+            logprobs, mask[:, 1:], "curr_logprobs"
+        )
+        data["token_mask"][:, 1:] = updated_mask
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")

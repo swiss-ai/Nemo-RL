@@ -28,7 +28,11 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import (
+    calculate_kl,
+    mask_out_neg_inf_logprobs,
+    masked_mean,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
@@ -41,6 +45,18 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
+
+
+def test_mask_out_neg_inf_logprobs_propagates_sampling_mismatch_mask():
+    logprobs = torch.tensor([[-1.0, -float("inf"), -2.0]])
+    mask = torch.ones_like(logprobs)
+
+    masked_logprobs, updated_mask = mask_out_neg_inf_logprobs(
+        logprobs, mask, "curr_logprobs"
+    )
+
+    torch.testing.assert_close(updated_mask, torch.tensor([[1.0, 0.0, 1.0]]))
+    torch.testing.assert_close(masked_logprobs, torch.tensor([[-1.0, 0.0, -2.0]]))
 
 
 @pytest.mark.parametrize(
